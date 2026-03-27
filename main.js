@@ -583,6 +583,8 @@ const MAX_BOT_MESSAGE_LENGTH = 1500;
 const EXEC_TIMEOUT_MS = Number(process.env.CODEX_EXEC_TIMEOUT_MS || 10 * 60 * 1000);
 const MAX_WORKDIR_SEARCH_RESULTS = 5;
 const MAX_WORKDIR_SEARCH_DIRS = 2500;
+const WORKDIR_SYSTEM_SEARCH_TIMEOUT_MS = 3000;
+const WORKDIR_SYSTEM_SEARCH_MAX_BUFFER = 512 * 1024;
 const WORKDIR_SEARCH_SKIP_NAMES = new Set([
   '.git',
   '.next',
@@ -711,14 +713,92 @@ function shouldSkipSearchDir(name) {
   return false;
 }
 
-function searchLocalDirectories(query, limit = MAX_WORKDIR_SEARCH_RESULTS) {
+function shouldSkipSearchPath(targetPath) {
+  const resolved = resolveInputPath(targetPath);
+  const segments = resolved.split(path.sep).filter(Boolean);
+  return segments.some((segment) => shouldSkipSearchDir(segment));
+}
+
+function isDirectoryPath(targetPath) {
+  try {
+    return fs.statSync(targetPath).isDirectory();
+  } catch (_) {
+    return false;
+  }
+}
+
+function normalizeDirectoryMatches(paths, limit = MAX_WORKDIR_SEARCH_RESULTS) {
+  const matches = [];
+  const seen = new Set();
+
+  for (const rawPath of paths) {
+    const resolved = resolveInputPath(rawPath);
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+
+    if (!isDirectoryPath(resolved)) continue;
+    if (shouldSkipSearchPath(resolved)) continue;
+
+    matches.push(resolved);
+    if (matches.length >= limit) break;
+  }
+
+  return matches;
+}
+
+function escapeMdfindQueryValue(value) {
+  return String(value || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"');
+}
+
+function searchDirectoriesWithMdfind(query, roots, limit = MAX_WORKDIR_SEARCH_RESULTS) {
+  if (process.platform !== 'darwin') return [];
+
+  const keyword = sanitizeText(query);
+  if (!keyword) return [];
+
+  const escapedKeyword = escapeMdfindQueryValue(keyword);
+  const predicate = [
+    `((kMDItemFSName == "*${escapedKeyword}*"cd)`,
+    `|| (kMDItemPath == "*${escapedKeyword}*"cd))`,
+    '&& (kMDItemContentTypeTree == "public.folder")'
+  ].join(' ');
+
+  const rawMatches = [];
+  for (const root of roots) {
+    const search = childProcess.spawnSync(
+      'mdfind',
+      ['-onlyin', root, predicate],
+      {
+        encoding: 'utf8',
+        timeout: WORKDIR_SYSTEM_SEARCH_TIMEOUT_MS,
+        maxBuffer: WORKDIR_SYSTEM_SEARCH_MAX_BUFFER
+      }
+    );
+
+    if (search.error || search.status !== 0) {
+      continue;
+    }
+
+    rawMatches.push(
+      ...String(search.stdout || '')
+        .split(/\r?\n/)
+        .map((line) => sanitizeText(line))
+        .filter(Boolean)
+    );
+  }
+
+  return normalizeDirectoryMatches(rawMatches, limit);
+}
+
+function searchLocalDirectoriesByTraversal(query, limit = MAX_WORKDIR_SEARCH_RESULTS) {
   const keyword = sanitizeText(query).toLowerCase();
   if (!keyword) return [];
 
-  const matches = [];
+  const rawMatches = [];
   const queued = [];
   const seenDirs = new Set();
-  const seenMatches = new Set();
 
   for (const root of getWorkdirSearchRoots()) {
     queued.push(root);
@@ -726,7 +806,7 @@ function searchLocalDirectories(query, limit = MAX_WORKDIR_SEARCH_RESULTS) {
   }
 
   let visitedCount = 0;
-  while (queued.length > 0 && matches.length < limit && visitedCount < MAX_WORKDIR_SEARCH_DIRS) {
+  while (queued.length > 0 && rawMatches.length < limit && visitedCount < MAX_WORKDIR_SEARCH_DIRS) {
     const currentDir = queued.shift();
     visitedCount += 1;
 
@@ -746,12 +826,10 @@ function searchLocalDirectories(query, limit = MAX_WORKDIR_SEARCH_RESULTS) {
       const normalizedPath = fullPath.toLowerCase();
 
       if (
-        (normalizedName.includes(keyword) || normalizedPath.includes(keyword)) &&
-        !seenMatches.has(fullPath)
+        (normalizedName.includes(keyword) || normalizedPath.includes(keyword))
       ) {
-        seenMatches.add(fullPath);
-        matches.push(fullPath);
-        if (matches.length >= limit) break;
+        rawMatches.push(fullPath);
+        if (rawMatches.length >= limit) break;
       }
 
       if (shouldSkipSearchDir(entry.name)) continue;
@@ -761,7 +839,17 @@ function searchLocalDirectories(query, limit = MAX_WORKDIR_SEARCH_RESULTS) {
     }
   }
 
-  return matches;
+  return normalizeDirectoryMatches(rawMatches, limit);
+}
+
+function searchLocalDirectories(query, limit = MAX_WORKDIR_SEARCH_RESULTS) {
+  const roots = getWorkdirSearchRoots();
+  const systemMatches = searchDirectoriesWithMdfind(query, roots, limit);
+  if (systemMatches.length > 0) {
+    return systemMatches;
+  }
+
+  return searchLocalDirectoriesByTraversal(query, limit);
 }
 
 function getSearchSelection(target) {
@@ -797,7 +885,7 @@ function getHelpMessage() {
     '/session - 查看当前工作目录的 Codex 会话状态',
     '/cwd - 查看当前工作目录',
     '/cwd <目录> - 切换到指定目录；切回旧目录会恢复该目录会话',
-    '/cwd <关键字> - 搜索本地目录并展示最多 5 个候选',
+    '/cwd <关键字> - 用本地系统搜索目录并展示最多 5 个候选',
     '/cwd <编号> - 选择最近一次搜索结果中的目录',
     '/access - 查看当前权限模式',
     '/access <read|write|safe|full> - 切换权限模式、清空队列并重置所有目录会话',
