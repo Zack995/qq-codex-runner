@@ -1,0 +1,29 @@
+{
+  "name": "qq-codex-runner",
+  "version": "0.1.0",
+  "description": "Bridge QQ bot messages to a local Codex CLI session with queueing, session reuse, cwd switching, and access mode control.",
+  "license": "MIT",
+  "bin": {
+    "qq-codex-runner": "./main.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:Zack995/qq-codex-runner.git"
+  },
+  "keywords": [
+    "qq",
+    "qq-bot",
+    "codex",
+    "cli",
+    "runner"
+  ],
+  "scripts": {
+    "start": "node main.js"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.19.0"
+  }
+}
