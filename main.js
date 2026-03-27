@@ -79,6 +79,20 @@ function parseList(value) {
     .filter(Boolean);
 }
 
+function expandHomeDir(value) {
+  const normalized = sanitizeText(value);
+  if (!normalized) return normalized;
+  if (normalized === '~') return os.homedir();
+  if (normalized.startsWith(`~${path.sep}`)) {
+    return path.join(os.homedir(), normalized.slice(2));
+  }
+  return normalized;
+}
+
+function resolveInputPath(value) {
+  return path.resolve(expandHomeDir(value));
+}
+
 function stripAtMentions(text) {
   return String(text || '').replace(/<@!?\d+>/g, ' ').replace(/\s+/g, ' ').trim();
 }
@@ -567,8 +581,23 @@ const qqBot = new QQBotClient({
 
 const MAX_BOT_MESSAGE_LENGTH = 1500;
 const EXEC_TIMEOUT_MS = Number(process.env.CODEX_EXEC_TIMEOUT_MS || 10 * 60 * 1000);
-const DEFAULT_WORKDIR = path.resolve(process.env.RUNNER_WORKDIR || process.cwd());
-const DEFAULT_ADD_DIRS = parseList(process.env.RUNNER_ADD_DIRS).map((item) => path.resolve(item));
+const MAX_WORKDIR_SEARCH_RESULTS = 5;
+const MAX_WORKDIR_SEARCH_DIRS = 2500;
+const WORKDIR_SEARCH_SKIP_NAMES = new Set([
+  '.git',
+  '.next',
+  '.nuxt',
+  '.svn',
+  '.Trash',
+  '.yarn',
+  'Applications',
+  'Library',
+  'System',
+  'Volumes',
+  'node_modules'
+]);
+const DEFAULT_WORKDIR = resolveInputPath(process.env.RUNNER_WORKDIR || process.cwd());
+const DEFAULT_ADD_DIRS = parseList(process.env.RUNNER_ADD_DIRS).map((item) => resolveInputPath(item));
 const VALID_ACCESS_MODES = new Map([
   ['read', { label: '只读', sandbox: 'read-only', bypass: false }],
   ['write', { label: '工作区可写', sandbox: 'workspace-write', bypass: false }],
@@ -579,20 +608,184 @@ const VALID_ACCESS_MODES = new Map([
 const taskQueue = [];
 let activeTask = null;
 let pendingApproval = null;
-let codexSession = {
-  hasConversation: false,
+const workdirSessions = new Map();
+let codexProcess = {
   busy: false,
   child: null,
-  generation: 0
+  session: null
 };
 let runnerState = {
   workdir: DEFAULT_WORKDIR,
   accessMode: sanitizeText(process.env.CODEX_ACCESS_MODE || 'safe').toLowerCase(),
   addDirs: DEFAULT_ADD_DIRS.slice()
 };
+let recentWorkdirSearch = {
+  query: '',
+  matches: []
+};
 
 if (!VALID_ACCESS_MODES.has(runnerState.accessMode)) {
   runnerState.accessMode = 'safe';
+}
+
+function createWorkdirSessionState() {
+  return {
+    hasConversation: false,
+    generation: 0
+  };
+}
+
+function getWorkdirSession(workdir = runnerState.workdir) {
+  const key = resolveInputPath(workdir);
+  if (!workdirSessions.has(key)) {
+    workdirSessions.set(key, createWorkdirSessionState());
+  }
+  return workdirSessions.get(key);
+}
+
+function getCurrentSession() {
+  return getWorkdirSession(runnerState.workdir);
+}
+
+function countActiveSessions() {
+  let count = 0;
+  for (const session of workdirSessions.values()) {
+    if (session.hasConversation) count += 1;
+  }
+  return count;
+}
+
+function bumpSessionGeneration(session) {
+  if (!session) return;
+  session.generation += 1;
+}
+
+function resetSessionState(session) {
+  if (!session) return;
+  session.hasConversation = false;
+  session.generation += 1;
+}
+
+function stopActiveCodexProcess(signal = 'SIGTERM') {
+  const child = codexProcess.child;
+  if (!child) return;
+  bumpSessionGeneration(codexProcess.session);
+  try {
+    child.kill(signal);
+  } catch (_) {}
+}
+
+function clearRecentWorkdirSearch() {
+  recentWorkdirSearch = {
+    query: '',
+    matches: []
+  };
+}
+
+function getWorkdirSearchRoots() {
+  const roots = [runnerState.workdir, DEFAULT_WORKDIR, ...runnerState.addDirs, os.homedir()];
+  const uniqueRoots = [];
+  const seen = new Set();
+
+  for (const rawRoot of roots) {
+    const resolved = resolveInputPath(rawRoot);
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+
+    try {
+      if (!fs.statSync(resolved).isDirectory()) continue;
+    } catch (_) {
+      continue;
+    }
+
+    uniqueRoots.push(resolved);
+  }
+
+  return uniqueRoots;
+}
+
+function shouldSkipSearchDir(name) {
+  if (!name) return false;
+  if (WORKDIR_SEARCH_SKIP_NAMES.has(name)) return true;
+  if (name.startsWith('.') && name !== '.config') return true;
+  return false;
+}
+
+function searchLocalDirectories(query, limit = MAX_WORKDIR_SEARCH_RESULTS) {
+  const keyword = sanitizeText(query).toLowerCase();
+  if (!keyword) return [];
+
+  const matches = [];
+  const queued = [];
+  const seenDirs = new Set();
+  const seenMatches = new Set();
+
+  for (const root of getWorkdirSearchRoots()) {
+    queued.push(root);
+    seenDirs.add(root);
+  }
+
+  let visitedCount = 0;
+  while (queued.length > 0 && matches.length < limit && visitedCount < MAX_WORKDIR_SEARCH_DIRS) {
+    const currentDir = queued.shift();
+    visitedCount += 1;
+
+    let entries;
+    try {
+      entries = fs.readdirSync(currentDir, { withFileTypes: true });
+    } catch (_) {
+      continue;
+    }
+
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+
+      const fullPath = path.join(currentDir, entry.name);
+      const normalizedName = entry.name.toLowerCase();
+      const normalizedPath = fullPath.toLowerCase();
+
+      if (
+        (normalizedName.includes(keyword) || normalizedPath.includes(keyword)) &&
+        !seenMatches.has(fullPath)
+      ) {
+        seenMatches.add(fullPath);
+        matches.push(fullPath);
+        if (matches.length >= limit) break;
+      }
+
+      if (shouldSkipSearchDir(entry.name)) continue;
+      if (seenDirs.has(fullPath)) continue;
+      seenDirs.add(fullPath);
+      queued.push(fullPath);
+    }
+  }
+
+  return matches;
+}
+
+function getSearchSelection(target) {
+  const selection = sanitizeText(target);
+  if (!/^\d+$/.test(selection)) return null;
+  const index = Number(selection);
+  if (index < 1 || index > recentWorkdirSearch.matches.length) return null;
+  return recentWorkdirSearch.matches[index - 1];
+}
+
+function formatWorkdirSearchMessage(query, matches) {
+  if (matches.length === 0) {
+    return [
+      `没有找到匹配目录：${query}`,
+      '你可以直接发送绝对路径，或继续用 /cwd <关键字> 搜索。'
+    ].join('\n');
+  }
+
+  const lines = [`找到最多 ${matches.length} 个目录候选：`];
+  for (let index = 0; index < matches.length; index += 1) {
+    lines.push(`${index + 1}. ${matches[index]}`);
+  }
+  lines.push('请发送 /cwd <编号> 选择目录，或继续发送 /cwd <关键字> 重新搜索。');
+  return lines.join('\n');
 }
 
 function getHelpMessage() {
@@ -601,25 +794,29 @@ function getHelpMessage() {
     '/help - 查看帮助',
     '/status - 查看运行状态',
     '/queue - 查看当前队列状态',
-    '/session - 查看当前 Codex 会话状态',
+    '/session - 查看当前工作目录的 Codex 会话状态',
     '/cwd - 查看当前工作目录',
-    '/cwd <目录> - 切换到指定目录并重置会话',
+    '/cwd <目录> - 切换到指定目录；切回旧目录会恢复该目录会话',
+    '/cwd <关键字> - 搜索本地目录并展示最多 5 个候选',
+    '/cwd <编号> - 选择最近一次搜索结果中的目录',
     '/access - 查看当前权限模式',
-    '/access <read|write|safe|full> - 切换权限模式',
-    '/new - 重置当前 Codex 会话',
-    '/restart - 清空队列并重置 runner 状态',
+    '/access <read|write|safe|full> - 切换权限模式、清空队列并重置所有目录会话',
+    '/new - 重置当前工作目录的 Codex 会话',
+    '/restart - 清空队列并重置所有目录会话',
     '/allow - 批准待审批命令',
     '/skip - 跳过待审批命令',
-    '/reject - 拒绝待审批命令并重置会话'
+    '/reject - 拒绝待审批命令并重置当前目录会话'
   ].join('\n');
 }
 
 function getStatusMessage() {
+  const currentSession = getCurrentSession();
   return [
     '运行状态：',
     `QQ 已连接：${qqBot.ready ? '是' : '否'}`,
-    `Codex 忙碌中：${codexSession.busy ? '是' : '否'}`,
-    `会话已建立：${codexSession.hasConversation ? '是' : '否'}`,
+    `Codex 忙碌中：${codexProcess.busy ? '是' : '否'}`,
+    `当前目录会话已建立：${currentSession.hasConversation ? '是' : '否'}`,
+    `已缓存目录会话：${countActiveSessions()}`,
     `队列长度：${taskQueue.length}`,
     `存在待审批：${pendingApproval ? '是' : '否'}`,
     `工作目录：${runnerState.workdir}`,
@@ -632,16 +829,18 @@ function getQueueMessage() {
     '队列状态：',
     `当前执行任务：${activeTask ? (activeTask.kind === 'approval' ? '审批任务' : '普通任务') : '无'}`,
     `排队任务数：${taskQueue.length}`,
-    `Codex 忙碌中：${codexSession.busy ? '是' : '否'}`
+    `Codex 忙碌中：${codexProcess.busy ? '是' : '否'}`
   ].join('\n');
 }
 
 function getSessionMessage() {
+  const currentSession = getCurrentSession();
   return [
     '会话状态：',
-    `会话已建立：${codexSession.hasConversation ? '是' : '否'}`,
-    `Codex 忙碌中：${codexSession.busy ? '是' : '否'}`,
-    `会话代次：${codexSession.generation}`,
+    `当前目录会话已建立：${currentSession.hasConversation ? '是' : '否'}`,
+    `Codex 忙碌中：${codexProcess.busy ? '是' : '否'}`,
+    `当前目录会话代次：${currentSession.generation}`,
+    `已缓存目录会话：${countActiveSessions()}`,
     `存在待审批：${pendingApproval ? '是' : '否'}`,
     `工作目录：${runnerState.workdir}`,
     `权限模式：${VALID_ACCESS_MODES.get(runnerState.accessMode).label}`,
@@ -713,7 +912,8 @@ async function safeSendReply(context, content) {
 }
 
 function buildCodexArgs(prompt, outputFile) {
-  const args = codexSession.hasConversation
+  const currentSession = getCurrentSession();
+  const args = currentSession.hasConversation
     ? ['exec', 'resume', '--last']
     : ['exec'];
   const accessConfig = VALID_ACCESS_MODES.get(runnerState.accessMode) || VALID_ACCESS_MODES.get('safe');
@@ -733,7 +933,8 @@ function buildCodexArgs(prompt, outputFile) {
 
 function runCodexExec(prompt) {
   return new Promise((resolve, reject) => {
-    const generation = codexSession.generation;
+    const session = getCurrentSession();
+    const generation = session.generation;
     const outputFile = path.join(os.tmpdir(), `qq-codex-runner-last-${process.pid}-${Date.now()}.txt`);
     const args = buildCodexArgs(prompt, outputFile);
     const child = childProcess.spawn(command, args, {
@@ -742,8 +943,9 @@ function runCodexExec(prompt) {
       stdio: ['ignore', 'pipe', 'pipe']
     });
 
-    codexSession.child = child;
-    codexSession.busy = true;
+    codexProcess.child = child;
+    codexProcess.busy = true;
+    codexProcess.session = session;
 
     let stdout = '';
     let stderr = '';
@@ -755,8 +957,13 @@ function runCodexExec(prompt) {
       try {
         child.kill('SIGTERM');
       } catch (_) {}
-      codexSession.child = null;
-      codexSession.busy = false;
+      codexProcess.child = null;
+      codexProcess.busy = false;
+      codexProcess.session = null;
+      if (generation !== session.generation) {
+        resolve(null);
+        return;
+      }
       reject(new Error(`Codex execution timed out after ${Math.floor(EXEC_TIMEOUT_MS / 1000)} seconds.`));
     }, EXEC_TIMEOUT_MS);
 
@@ -772,8 +979,13 @@ function runCodexExec(prompt) {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
-      codexSession.child = null;
-      codexSession.busy = false;
+      codexProcess.child = null;
+      codexProcess.busy = false;
+      codexProcess.session = null;
+      if (generation !== session.generation) {
+        resolve(null);
+        return;
+      }
       reject(error);
     });
 
@@ -781,8 +993,9 @@ function runCodexExec(prompt) {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
-      codexSession.child = null;
-      codexSession.busy = false;
+      codexProcess.child = null;
+      codexProcess.busy = false;
+      codexProcess.session = null;
 
       let finalMessage = '';
       try {
@@ -792,7 +1005,7 @@ function runCodexExec(prompt) {
         fs.unlinkSync(outputFile);
       } catch (_) {}
 
-      if (generation !== codexSession.generation) {
+      if (generation !== session.generation) {
         resolve(null);
         return;
       }
@@ -809,7 +1022,7 @@ function runCodexExec(prompt) {
 
       const events = parseExecJsonEvents(stdout);
       if (events.length > 0 || sanitizeText(finalMessage)) {
-        codexSession.hasConversation = true;
+        session.hasConversation = true;
       }
 
       const normalized = sanitizeText(finalMessage);
@@ -824,83 +1037,84 @@ function runCodexExec(prompt) {
 }
 
 async function resetCodexSession(context) {
-  const previous = codexSession;
-  codexSession = {
-    hasConversation: false,
-    busy: false,
-    child: null,
-    generation: previous.generation + 1
-  };
+  resetSessionState(getCurrentSession());
   pendingApproval = null;
-
-  if (previous && previous.child) {
-    try {
-      previous.child.kill('SIGTERM');
-    } catch (_) {}
-  }
+  clearRecentWorkdirSearch();
+  stopActiveCodexProcess();
 
   await safeSendReply(context, 'Codex 会话已重置，下一条消息会启动新的对话。');
 }
 
 async function restartRunner(context) {
-  const previous = codexSession;
-  codexSession = {
-    hasConversation: false,
-    busy: false,
-    child: null,
-    generation: previous.generation + 1
-  };
+  stopActiveCodexProcess();
   pendingApproval = null;
   taskQueue.length = 0;
+  clearRecentWorkdirSearch();
+  workdirSessions.clear();
 
-  if (previous && previous.child) {
-    try {
-      previous.child.kill('SIGTERM');
-    } catch (_) {}
-  }
-
-  await safeSendReply(context, 'Runner 状态已重启：队列已清空，Codex 会话已重置。');
+  await safeSendReply(context, 'Runner 状态已重启：队列已清空，所有目录会话已重置。');
 }
 
-async function switchWorkdir(context, rawDir) {
+async function switchWorkdir(context, rawDir, options = {}) {
+  const resolved = resolveInputPath(rawDir);
+  const currentDir = runnerState.workdir;
+  const { fromSearchSelection = false } = options;
+
+  if (resolved === currentDir) {
+    clearRecentWorkdirSearch();
+    await safeSendReply(context, `当前已经在该目录：${resolved}`);
+    return;
+  }
+
+  stopActiveCodexProcess();
+  pendingApproval = null;
+  taskQueue.length = 0;
+  clearRecentWorkdirSearch();
+
+  runnerState.workdir = resolved;
+  const targetSession = getCurrentSession();
+  const switchHint = fromSearchSelection ? '已根据搜索结果切换工作目录。' : '已切换工作目录。';
+  const sessionHint = targetSession.hasConversation
+    ? '已恢复该目录之前的 Codex 会话。'
+    : '这是该目录的首次会话，下一条消息会新开对话。';
+  await safeSendReply(context, `${switchHint}\n当前目录：${resolved}\n${sessionHint}`);
+}
+
+async function handleWorkdirCommand(context, rawDir) {
   const target = sanitizeText(rawDir);
   if (!target) {
     await safeSendReply(context, getWorkdirMessage());
     return;
   }
 
-  const resolved = path.resolve(target);
-  let stat;
+  const resolved = resolveInputPath(target);
+  let stat = null;
   try {
     stat = fs.statSync(resolved);
-  } catch (_) {
-    await safeSendReply(context, `目录不存在：${resolved}`);
+  } catch (_) {}
+
+  if (stat && stat.isDirectory()) {
+    await switchWorkdir(context, resolved);
     return;
   }
 
-  if (!stat.isDirectory()) {
+  const selection = getSearchSelection(target);
+  if (selection) {
+    await switchWorkdir(context, selection, { fromSearchSelection: true });
+    return;
+  }
+
+  if (stat && !stat.isDirectory()) {
     await safeSendReply(context, `目标不是目录：${resolved}`);
     return;
   }
 
-  runnerState.workdir = resolved;
-  const previous = codexSession;
-  codexSession = {
-    hasConversation: false,
-    busy: false,
-    child: null,
-    generation: previous.generation + 1
+  const matches = searchLocalDirectories(target);
+  recentWorkdirSearch = {
+    query: target,
+    matches
   };
-  pendingApproval = null;
-  taskQueue.length = 0;
-
-  if (previous && previous.child) {
-    try {
-      previous.child.kill('SIGTERM');
-    } catch (_) {}
-  }
-
-  await safeSendReply(context, `工作目录已切换到：${resolved}\n已重置当前会话并清空等待队列。`);
+  await safeSendReply(context, formatWorkdirSearchMessage(target, matches));
 }
 
 async function switchAccessMode(context, rawMode) {
@@ -916,30 +1130,22 @@ async function switchAccessMode(context, rawMode) {
   }
 
   runnerState.accessMode = mode;
-  const previous = codexSession;
-  codexSession = {
-    hasConversation: false,
-    busy: false,
-    child: null,
-    generation: previous.generation + 1
-  };
+  stopActiveCodexProcess();
   pendingApproval = null;
   taskQueue.length = 0;
-
-  if (previous && previous.child) {
-    try {
-      previous.child.kill('SIGTERM');
-    } catch (_) {}
-  }
+  clearRecentWorkdirSearch();
+  workdirSessions.clear();
 
   await safeSendReply(
     context,
-    `权限模式已切换为：${VALID_ACCESS_MODES.get(mode).label}\n已重置当前会话并清空等待队列。`
+    `权限模式已切换为：${VALID_ACCESS_MODES.get(mode).label}\n已清空等待队列，并重置所有目录会话。`
   );
 }
 
 async function executeTask(task) {
-  if (codexSession.busy) {
+  runnerState.workdir = task.workdir;
+
+  if (codexProcess.busy) {
     await safeSendReply(task.context, 'Codex 正在处理上一条消息，请稍候。');
     return;
   }
@@ -961,7 +1167,8 @@ async function executeTask(task) {
       pendingApproval = {
         command: approval.command,
         reason: approval.reason,
-        context: task.context
+        context: task.context,
+        workdir: task.workdir
       };
       const approvalMessage = [
         '检测到需要审批的操作：',
@@ -982,6 +1189,7 @@ async function executeTask(task) {
 
 async function processQueue() {
   if (activeTask || taskQueue.length === 0) return;
+  if (pendingApproval && taskQueue[0] && taskQueue[0].kind !== 'approval') return;
 
   const task = taskQueue.shift();
   if (!task) return;
@@ -991,7 +1199,7 @@ async function processQueue() {
     await executeTask(task);
   } finally {
     activeTask = null;
-    if (!codexSession.busy && taskQueue.length > 0) {
+    if (!codexProcess.busy && taskQueue.length > 0) {
       void processQueue();
     }
   }
@@ -1031,7 +1239,7 @@ async function enqueueMessage(eventType, message) {
   }
 
   if (commandWord === '/cwd') {
-    await switchWorkdir(context, commandArg);
+    await handleWorkdirCommand(context, commandArg);
     return;
   }
 
@@ -1069,11 +1277,12 @@ async function enqueueMessage(eventType, message) {
       kind: 'approval',
       action: input === '/allow' ? 'allow' : 'skip',
       input,
-      context
+      context,
+      workdir: pendingApproval.workdir
     };
 
-    const queuedAhead = (activeTask ? 1 : 0) + taskQueue.length;
-    taskQueue.push(approvalTask);
+    const queuedAhead = activeTask ? 1 : 0;
+    taskQueue.unshift(approvalTask);
     if (queuedAhead > 0) {
       await safeSendReply(context, `已加入队列，前面还有 ${queuedAhead} 个任务。`);
     }
@@ -1095,7 +1304,8 @@ async function enqueueMessage(eventType, message) {
     kind: 'user',
     action: null,
     input,
-    context
+    context,
+    workdir: runnerState.workdir
   };
 
   const queuedAhead = (activeTask ? 1 : 0) + taskQueue.length;
@@ -1110,9 +1320,9 @@ qqBot.onMessage(enqueueMessage);
 
 for (const signalName of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   process.on(signalName, async () => {
-    if (codexSession && codexSession.child) {
+    if (codexProcess && codexProcess.child) {
       try {
-        codexSession.child.kill(signalName);
+        codexProcess.child.kill(signalName);
       } catch (_) {}
     }
     await qqBot.close();
