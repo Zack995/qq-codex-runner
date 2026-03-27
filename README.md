@@ -13,6 +13,7 @@
 
 - 接收 QQ 频道消息和 C2C 私聊消息
 - 按工作目录启动并复用本地 Codex CLI 会话
+- 进程重启后恢复上次工作目录、权限模式和已知目录会话
 - 支持 `/cwd` 本地目录搜索与编号选择
 - 支持 `/new` 重置当前目录会话
 - 支持 `/allow`、`/skip`、`/reject`
@@ -50,6 +51,11 @@ RUNNER_WORKDIR=/absolute/path/to/workspace
 RUNNER_ADD_DIRS=/path/one,/path/two
 CODEX_ACCESS_MODE=safe
 ```
+
+说明：
+
+- `RUNNER_WORKDIR` 是首次启动或没有运行时状态文件时的默认目录
+- 一旦 runner 已运行过，后续进程重启会优先恢复上次保存的工作目录和权限模式
 
 ## 启动
 
@@ -138,6 +144,7 @@ tail -f ./logs/runner.log
 ## 说明
 
 - `/cwd` 切换目录时会清空等待队列；目录之间的会话彼此独立，切回旧目录会恢复该目录之前的会话
+- runner 进程重启后，会优先恢复上次保存的工作目录、权限模式和已知目录会话；如果没有状态文件，才回退到 `RUNNER_WORKDIR` 或启动目录
 - `/cwd <关键字>` 在 macOS 上会优先使用 Spotlight 索引搜索目录；如果系统搜索不可用或没有结果，会回退到内置目录遍历
 - `/access` 切换后会清空等待队列，并重置所有目录会话，避免不同权限模式下的上下文混用
 - `full` 模式会把 Codex 切到完全访问能力，请只在你明确知道后果时使用

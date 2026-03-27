@@ -585,6 +585,7 @@ const MAX_WORKDIR_SEARCH_RESULTS = 5;
 const MAX_WORKDIR_SEARCH_DIRS = 2500;
 const WORKDIR_SYSTEM_SEARCH_TIMEOUT_MS = 3000;
 const WORKDIR_SYSTEM_SEARCH_MAX_BUFFER = 512 * 1024;
+const RUNNER_STATE_FILE = path.resolve(process.cwd(), 'logs', 'runner-state.json');
 const WORKDIR_SEARCH_SKIP_NAMES = new Set([
   '.git',
   '.next',
@@ -606,6 +607,8 @@ const VALID_ACCESS_MODES = new Map([
   ['safe', { label: '安全模式', sandbox: 'workspace-write', bypass: false }],
   ['full', { label: '完全访问', sandbox: 'danger-full-access', bypass: true }]
 ]);
+const persistedRunnerState = loadPersistedRunnerState();
+const initialRunnerState = deriveInitialRunnerState(persistedRunnerState);
 
 const taskQueue = [];
 let activeTask = null;
@@ -617,8 +620,8 @@ let codexProcess = {
   session: null
 };
 let runnerState = {
-  workdir: DEFAULT_WORKDIR,
-  accessMode: sanitizeText(process.env.CODEX_ACCESS_MODE || 'safe').toLowerCase(),
+  workdir: initialRunnerState.workdir,
+  accessMode: initialRunnerState.accessMode,
   addDirs: DEFAULT_ADD_DIRS.slice()
 };
 let recentWorkdirSearch = {
@@ -630,11 +633,78 @@ if (!VALID_ACCESS_MODES.has(runnerState.accessMode)) {
   runnerState.accessMode = 'safe';
 }
 
+hydratePersistedWorkdirSessions(persistedRunnerState);
+persistRunnerState();
+
 function createWorkdirSessionState() {
   return {
     hasConversation: false,
     generation: 0
   };
+}
+
+function loadPersistedRunnerState() {
+  let rawContent = '';
+  try {
+    rawContent = fs.readFileSync(RUNNER_STATE_FILE, 'utf8');
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return null;
+    log(`Failed to read runner state: ${error && error.message ? error.message : String(error)}`);
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(rawContent);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (error) {
+    log(`Failed to parse runner state: ${error && error.message ? error.message : String(error)}`);
+    return null;
+  }
+}
+
+function resolveExistingDirectory(targetPath) {
+  const normalized = sanitizeText(targetPath);
+  if (!normalized) return null;
+  const resolved = resolveInputPath(normalized);
+  try {
+    if (!fs.statSync(resolved).isDirectory()) return null;
+  } catch (_) {
+    return null;
+  }
+  return resolved;
+}
+
+function deriveInitialRunnerState(persistedState) {
+  const fallbackAccessMode = sanitizeText(process.env.CODEX_ACCESS_MODE || 'safe').toLowerCase();
+  const nextState = {
+    workdir: DEFAULT_WORKDIR,
+    accessMode: fallbackAccessMode
+  };
+
+  const persistedWorkdir = persistedState ? resolveExistingDirectory(persistedState.workdir) : null;
+  if (persistedWorkdir) {
+    nextState.workdir = persistedWorkdir;
+  }
+
+  const persistedAccessMode = sanitizeText(persistedState && persistedState.accessMode);
+  if (persistedAccessMode && VALID_ACCESS_MODES.has(persistedAccessMode.toLowerCase())) {
+    nextState.accessMode = persistedAccessMode.toLowerCase();
+  }
+
+  return nextState;
+}
+
+function hydratePersistedWorkdirSessions(persistedState) {
+  if (!persistedState || !Array.isArray(persistedState.sessionWorkdirs)) return;
+
+  for (const rawWorkdir of persistedState.sessionWorkdirs) {
+    const resolved = resolveExistingDirectory(rawWorkdir);
+    if (!resolved) continue;
+    workdirSessions.set(resolved, {
+      hasConversation: true,
+      generation: 0
+    });
+  }
 }
 
 function getWorkdirSession(workdir = runnerState.workdir) {
@@ -655,6 +725,39 @@ function countActiveSessions() {
     if (session.hasConversation) count += 1;
   }
   return count;
+}
+
+function buildPersistedRunnerState() {
+  const sessionWorkdirs = [];
+  for (const [workdir, session] of workdirSessions.entries()) {
+    if (session && session.hasConversation) {
+      sessionWorkdirs.push(workdir);
+    }
+  }
+
+  sessionWorkdirs.sort((left, right) => left.localeCompare(right));
+  return {
+    version: 1,
+    workdir: runnerState.workdir,
+    accessMode: runnerState.accessMode,
+    sessionWorkdirs
+  };
+}
+
+function persistRunnerState() {
+  const payload = JSON.stringify(buildPersistedRunnerState(), null, 2);
+  const tempFile = `${RUNNER_STATE_FILE}.tmp`;
+
+  try {
+    fs.mkdirSync(path.dirname(RUNNER_STATE_FILE), { recursive: true });
+    fs.writeFileSync(tempFile, payload, 'utf8');
+    fs.renameSync(tempFile, RUNNER_STATE_FILE);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tempFile);
+    } catch (_) {}
+    log(`Failed to persist runner state: ${error && error.message ? error.message : String(error)}`);
+  }
 }
 
 function bumpSessionGeneration(session) {
@@ -1112,6 +1215,7 @@ function runCodexExec(prompt) {
       const events = parseExecJsonEvents(stdout);
       if (events.length > 0 || sanitizeText(finalMessage)) {
         session.hasConversation = true;
+        persistRunnerState();
       }
 
       const normalized = sanitizeText(finalMessage);
@@ -1130,6 +1234,7 @@ async function resetCodexSession(context) {
   pendingApproval = null;
   clearRecentWorkdirSearch();
   stopActiveCodexProcess();
+  persistRunnerState();
 
   await safeSendReply(context, 'Codex 会话已重置，下一条消息会启动新的对话。');
 }
@@ -1140,6 +1245,7 @@ async function restartRunner(context) {
   taskQueue.length = 0;
   clearRecentWorkdirSearch();
   workdirSessions.clear();
+  persistRunnerState();
 
   await safeSendReply(context, 'Runner 状态已重启：队列已清空，所有目录会话已重置。');
 }
@@ -1162,6 +1268,7 @@ async function switchWorkdir(context, rawDir, options = {}) {
 
   runnerState.workdir = resolved;
   const targetSession = getCurrentSession();
+  persistRunnerState();
   const switchHint = fromSearchSelection ? '已根据搜索结果切换工作目录。' : '已切换工作目录。';
   const sessionHint = targetSession.hasConversation
     ? '已恢复该目录之前的 Codex 会话。'
@@ -1224,6 +1331,7 @@ async function switchAccessMode(context, rawMode) {
   taskQueue.length = 0;
   clearRecentWorkdirSearch();
   workdirSessions.clear();
+  persistRunnerState();
 
   await safeSendReply(
     context,
