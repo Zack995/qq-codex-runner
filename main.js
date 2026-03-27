@@ -1001,9 +1001,7 @@ async function safeSendReply(context, content) {
 
 function buildCodexArgs(prompt, outputFile) {
   const currentSession = getCurrentSession();
-  const args = currentSession.hasConversation
-    ? ['exec', 'resume', '--last']
-    : ['exec'];
+  const args = ['exec'];
   const accessConfig = VALID_ACCESS_MODES.get(runnerState.accessMode) || VALID_ACCESS_MODES.get('safe');
   args.push('-C', runnerState.workdir);
   args.push('-s', accessConfig.sandbox);
@@ -1012,6 +1010,9 @@ function buildCodexArgs(prompt, outputFile) {
   }
   if (accessConfig.bypass) {
     args.push('--dangerously-bypass-approvals-and-sandbox');
+  }
+  if (currentSession.hasConversation) {
+    args.push('resume', '--last');
   }
   args.push('--skip-git-repo-check', '--json', '--output-last-message', outputFile);
   args.push(...codexArgs);
