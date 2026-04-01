@@ -71,6 +71,7 @@ WEIXIN_BOT_TYPE=3
 - 一旦 runner 已运行过，后续进程重启会优先恢复上次保存的工作目录和权限模式
 - `CODEX_EXEC_TIMEOUT_MS` 表示“无新输出超时”，不是固定总时长；设为 `0` 可禁用
 - `RUNNER_CODEX_HOME` 用于让 runner 使用独立的 Codex 状态目录，避免和你手动开的 `codex` 混用 `resume --last`
+  runner 在首次初始化该目录时，会从现有 `CODEX_HOME` 复制必要配置文件（如 `auth.json`、`config.toml`），避免出现 API key 或 base URL 缺失
 - `WEIXIN_*` 配置控制微信长轮询接入；当前先支持文本收发
 - 服务运行中执行扫码登录命令后，微信客户端会自动热加载，无需重启 runner
 - 微信可以通过扫码登录写入本地凭证，登录后无需手工填写 `WEIXIN_TOKEN`

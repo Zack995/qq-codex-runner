@@ -264,6 +264,61 @@ function sleep(ms) {
   });
 }
 
+const CODEX_HOME_TEMPLATE_ITEMS = [
+  'auth.json',
+  'config.toml',
+  'AGENTS.md',
+  'rules',
+  'skills',
+  'vendor_imports'
+];
+
+function copyCodexHomeTemplate(sourceRoot, targetRoot) {
+  if (!sourceRoot || !targetRoot) return;
+  if (sourceRoot === targetRoot) return;
+  if (!fs.existsSync(sourceRoot)) return;
+
+  let sourceStat;
+  try {
+    sourceStat = fs.statSync(sourceRoot);
+  } catch (_) {
+    return;
+  }
+  if (!sourceStat.isDirectory()) return;
+
+  for (const relativePath of CODEX_HOME_TEMPLATE_ITEMS) {
+    const sourcePath = path.join(sourceRoot, relativePath);
+    const targetPath = path.join(targetRoot, relativePath);
+    if (!fs.existsSync(sourcePath) || fs.existsSync(targetPath)) continue;
+
+    fs.cpSync(sourcePath, targetPath, {
+      recursive: true,
+      force: false,
+      errorOnExist: false
+    });
+    log(`Copied Codex config asset: ${relativePath}`);
+  }
+}
+
+function prepareCodexHome(rawPath, sourcePath) {
+  const normalized = sanitizeText(rawPath);
+  if (!normalized) return '';
+
+  const resolved = resolveInputPath(normalized);
+  fs.mkdirSync(resolved, { recursive: true });
+  copyCodexHomeTemplate(
+    sanitizeText(sourcePath) ? resolveInputPath(sourcePath) : '',
+    resolved
+  );
+
+  const stat = fs.statSync(resolved);
+  if (!stat.isDirectory()) {
+    throw new Error(`RUNNER_CODEX_HOME is not a directory: ${resolved}`);
+  }
+
+  return resolved;
+}
+
 async function requestTextWithTimeout(urlString, options = {}) {
   const timeoutMs = Number(options.timeoutMs || 0);
   const headers = options.headers || {};
@@ -708,7 +763,7 @@ class WeixinClient {
     }
     const clientId = crypto.randomUUID();
 
-    await this.request(
+    const response = await this.request(
       'ilink/bot/sendmessage',
       {
         msg: {
@@ -730,6 +785,18 @@ class WeixinClient {
         }
       },
       this.apiTimeoutMs
+    );
+
+    if ((Number(response && response.ret) || 0) !== 0 || (Number(response && response.errcode) || 0) !== 0) {
+      throw new Error(
+        `Weixin sendmessage failed: ret=${Number(response && response.ret) || 0} errcode=${
+          Number(response && response.errcode) || 0
+        } errmsg=${sanitizeText(response && response.errmsg) || 'unknown error'}`
+      );
+    }
+
+    log(
+      `Weixin outbound sent: to=${normalizedToUserId} clientId=${clientId} textLen=${String(text || '').length}`
     );
   }
 
@@ -1046,7 +1113,11 @@ const MAX_WORKDIR_SEARCH_DIRS = 2500;
 const WORKDIR_SYSTEM_SEARCH_TIMEOUT_MS = 3000;
 const WORKDIR_SYSTEM_SEARCH_MAX_BUFFER = 512 * 1024;
 const RUNNER_STATE_FILE = path.resolve(process.cwd(), 'logs', 'runner-state.json');
-const RUNNER_CODEX_HOME = sanitizeText(process.env.RUNNER_CODEX_HOME || process.env.CODEX_HOME || '');
+const PRIMARY_CODEX_HOME = sanitizeText(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'));
+const RUNNER_CODEX_HOME = prepareCodexHome(
+  process.env.RUNNER_CODEX_HOME || process.env.CODEX_HOME || '',
+  PRIMARY_CODEX_HOME
+);
 const WORKDIR_SEARCH_SKIP_NAMES = new Set([
   '.git',
   '.next',
