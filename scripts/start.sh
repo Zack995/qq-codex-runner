@@ -1,9 +1,10 @@
 #!/bin/zsh
 set -euo pipefail
 
-PROJECT_DIR="/Users/zhangzuocong/Documents/git/qq-codex-runner"
+cd -- "$(dirname -- "$0")/.."
+
 SESSION_NAME="qq-codex-runner"
-LOG_DIR="$PROJECT_DIR/logs"
+LOG_DIR="logs"
 LOG_FILE="$LOG_DIR/runner.log"
 PID_FILE="$LOG_DIR/runner.pid"
 
@@ -21,8 +22,7 @@ fi
 
 screen -S "$SESSION_NAME" -X quit >/dev/null 2>&1 || true
 
-cd "$PROJECT_DIR"
-screen -dmS "$SESSION_NAME" zsh -lc "cd '$PROJECT_DIR' && echo \$\$ > '$PID_FILE' && exec node main.js >> '$LOG_FILE' 2>&1"
+screen -dmS "$SESSION_NAME" zsh -lc "echo \$\$ > '$PID_FILE' && exec node main.js >> '$LOG_FILE' 2>&1"
 
 for _ in 1 2 3 4 5; do
   sleep 1

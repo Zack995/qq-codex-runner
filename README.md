@@ -51,11 +51,11 @@ QQ_BOT_SECRET=your_app_secret
 常用可选配置：
 
 ```env
-CODEX_BIN=/absolute/path/to/codex
-CODEX_HOME=/absolute/path/to/.codex
-RUNNER_CODEX_HOME=/absolute/path/to/.codex-qq-runner
-RUNNER_WORKDIR=/absolute/path/to/workspace
-RUNNER_ADD_DIRS=/path/one,/path/two
+CODEX_BIN=./bin/codex
+CODEX_HOME=../.codex
+RUNNER_CODEX_HOME=../.codex-qq-runner
+RUNNER_WORKDIR=.
+RUNNER_ADD_DIRS=./workspace,./shared
 CODEX_ACCESS_MODE=safe
 CODEX_EXEC_TIMEOUT_MS=1800000
 WEIXIN_ENABLED=true
@@ -123,9 +123,9 @@ node main.js --weixin-logout --weixin-account my-weixin
 ```env
 QQ_BOT_APP_ID=your_app_id
 QQ_BOT_SECRET=your_app_secret
-CODEX_BIN=/absolute/path/to/codex
-CODEX_HOME=/absolute/path/to/.codex
-RUNNER_CODEX_HOME=/absolute/path/to/.codex-qq-runner
+CODEX_BIN=./bin/codex
+CODEX_HOME=../.codex
+RUNNER_CODEX_HOME=../.codex-qq-runner
 WEIXIN_ENABLED=true
 WEIXIN_ACCOUNT_ID=default
 WEIXIN_BOT_TYPE=3
@@ -416,5 +416,5 @@ node main.js -- --model gpt-5.4
 如果要指定 `codex` 可执行路径：
 
 ```bash
-node main.js --cmd /absolute/path/to/codex
+node main.js --cmd ./bin/codex
 ```

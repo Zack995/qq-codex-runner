@@ -1,10 +1,11 @@
 #!/bin/zsh
 set -euo pipefail
 
+cd -- "$(dirname -- "$0")/.."
+
 SESSION_NAME="qq-codex-runner"
-PROJECT_DIR="/Users/zhangzuocong/Documents/git/qq-codex-runner"
-LOG_FILE="$PROJECT_DIR/logs/runner.log"
-PID_FILE="$PROJECT_DIR/logs/runner.pid"
+LOG_FILE="logs/runner.log"
+PID_FILE="logs/runner.pid"
 
 PID=""
 if [ -f "$PID_FILE" ]; then
