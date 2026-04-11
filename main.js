@@ -125,6 +125,65 @@ function log(message) {
   process.stderr.write(`[qq-codex-runner] ${message}\n`);
 }
 
+function parsePositiveInteger(value) {
+  const normalized = sanitizeText(value);
+  if (!normalized) return null;
+  const parsed = Number(normalized);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.floor(parsed);
+}
+
+function getPositiveIntegerEnv(name) {
+  const rawValue = sanitizeText(process.env[name]);
+  if (!rawValue) return null;
+
+  const parsed = parsePositiveInteger(rawValue);
+  if (parsed === null) {
+    log(`Ignoring invalid ${name}: ${rawValue}`);
+    return null;
+  }
+
+  return parsed;
+}
+
+function escapeRegExp(text) {
+  return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function readTopLevelTomlValue(filePath, key) {
+  if (!filePath || !key) return null;
+
+  let content = '';
+  try {
+    content = fs.readFileSync(filePath, 'utf8');
+  } catch (_) {
+    return null;
+  }
+
+  const match = content.match(new RegExp(`^${escapeRegExp(key)}\\s*=\\s*(.+)$`, 'm'));
+  if (!match) return null;
+
+  const withoutComment = match[1].replace(/\s+#.*$/, '').trim();
+  if (!withoutComment) return null;
+
+  if (
+    (withoutComment.startsWith('"') && withoutComment.endsWith('"')) ||
+    (withoutComment.startsWith("'") && withoutComment.endsWith("'"))
+  ) {
+    return withoutComment.slice(1, -1);
+  }
+
+  if (/^-?\d+$/.test(withoutComment)) {
+    return Number(withoutComment);
+  }
+
+  if (/^(true|false)$/i.test(withoutComment)) {
+    return withoutComment.toLowerCase() === 'true';
+  }
+
+  return withoutComment;
+}
+
 function nextMsgSeq() {
   return Math.floor(Math.random() * 65535) + 1;
 }
@@ -1069,30 +1128,12 @@ function buildAgentPolicyPrompt() {
   return APPROVAL_POLICY_PROMPT;
 }
 
-function buildUserPrompt(input) {
-  return `${buildAgentPolicyPrompt()}\n\n[User message]\n${input}\n[/User message]`;
+function buildUserPrompt(input, options = {}) {
+  return buildChatTurnPrompt(input, options);
 }
 
-function buildApprovalPrompt(action, pendingApproval) {
-  const policyPrompt = buildAgentPolicyPrompt();
-  if (!pendingApproval) return policyPrompt;
-  if (action === 'allow') {
-    return [
-      policyPrompt,
-      '',
-      'The user approved your last requested command.',
-      `Approved command: ${pendingApproval.command}`,
-      `Reason: ${pendingApproval.reason || 'not provided'}`,
-      'Continue the original task.'
-    ].join('\n');
-  }
-  return [
-    policyPrompt,
-    '',
-    'The user rejected the last requested command for execution.',
-    `Blocked command: ${pendingApproval.command}`,
-    'Continue the original task without executing that command.'
-  ].join('\n');
+function buildApprovalPrompt(action, pendingApproval, options = {}) {
+  return buildApprovalTurnPrompt(action, pendingApproval, options);
 }
 
 loadDotEnv();
@@ -1118,6 +1159,8 @@ const RUNNER_CODEX_HOME = prepareCodexHome(
   process.env.RUNNER_CODEX_HOME || process.env.CODEX_HOME || '',
   PRIMARY_CODEX_HOME
 );
+const CODEX_CONTEXT_WINDOW_OVERRIDE = getPositiveIntegerEnv('CODEX_CONTEXT_WINDOW');
+const CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE = getPositiveIntegerEnv('CODEX_AUTO_COMPACT_TOKEN_LIMIT');
 const WORKDIR_SEARCH_SKIP_NAMES = new Set([
   '.git',
   '.next',
@@ -1163,6 +1206,81 @@ let recentWorkdirSearch = {
 let weixinState = deriveInitialWeixinState(persistedRunnerState);
 let weixinBot = null;
 let runnerStateWatcher = null;
+
+function buildChatTurnPrompt(input, options = {}) {
+  const includePolicy = options.includePolicy !== false;
+  const parts = [];
+  if (includePolicy) {
+    parts.push(buildAgentPolicyPrompt(), '');
+  }
+  parts.push(`[User message]\n${input}\n[/User message]`);
+  return parts.join('\n');
+}
+
+function buildApprovalTurnPrompt(action, approval, options = {}) {
+  const includePolicy = options.includePolicy !== false;
+  const parts = [];
+  if (includePolicy) {
+    parts.push(buildAgentPolicyPrompt(), '');
+  }
+
+  if (!approval) {
+    return parts.join('\n').trim();
+  }
+
+  if (action === 'allow') {
+    parts.push(
+      'The user approved your last requested command.',
+      `Approved command: ${approval.command}`,
+      `Reason: ${approval.reason || 'not provided'}`,
+      'Continue the original task.'
+    );
+    return parts.join('\n');
+  }
+
+  parts.push(
+    'The user rejected the last requested command for execution.',
+    `Blocked command: ${approval.command}`,
+    'Continue the original task without executing that command.'
+  );
+  return parts.join('\n');
+}
+
+function getCodexConfigFilePath() {
+  const configHome = RUNNER_CODEX_HOME || PRIMARY_CODEX_HOME;
+  if (!configHome) return '';
+  return path.join(configHome, 'config.toml');
+}
+
+function getEffectiveCodexContextWindow() {
+  if (CODEX_CONTEXT_WINDOW_OVERRIDE) return CODEX_CONTEXT_WINDOW_OVERRIDE;
+  return parsePositiveInteger(readTopLevelTomlValue(getCodexConfigFilePath(), 'model_context_window'));
+}
+
+function getEffectiveCodexAutoCompactTokenLimit() {
+  if (CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE) {
+    return CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE;
+  }
+  return parsePositiveInteger(readTopLevelTomlValue(getCodexConfigFilePath(), 'model_auto_compact_token_limit'));
+}
+
+function formatCodexConfigValue(value, options = {}) {
+  if (!value) return '未配置';
+  if (options.overridden) return `${value}（env 覆盖）`;
+  return String(value);
+}
+
+function getCodexAutoCompactStatus() {
+  const contextWindow = getEffectiveCodexContextWindow();
+  const compactLimit = getEffectiveCodexAutoCompactTokenLimit();
+  if (!compactLimit) {
+    return '未配置自动压缩阈值';
+  }
+  if (contextWindow && compactLimit >= Math.floor(contextWindow * 0.8)) {
+    return '阈值接近上下文窗口，可能较难触发自动压缩';
+  }
+  return '已启用';
+}
 const WEIXIN_ACCOUNT_ID = sanitizeText(process.env.WEIXIN_ACCOUNT_ID || 'default') || 'default';
 
 if (!VALID_ACCESS_MODES.has(runnerState.accessMode)) {
@@ -1769,6 +1887,8 @@ function getHelpMessage() {
 
 function getStatusMessage(context) {
   const currentSession = getSessionForContext(context);
+  const contextWindow = getEffectiveCodexContextWindow();
+  const autoCompactTokenLimit = getEffectiveCodexAutoCompactTokenLimit();
   return [
     '运行状态：',
     `QQ 已连接：${qqBot ? (qqBot.ready ? '是' : '否') : '否'}`,
@@ -1781,7 +1901,14 @@ function getStatusMessage(context) {
     `存在待审批：${pendingApproval ? '是' : '否'}`,
     `工作目录：${runnerState.workdir}`,
     `权限模式：${VALID_ACCESS_MODES.get(runnerState.accessMode).label}`,
-    `Runner CODEX_HOME：${RUNNER_CODEX_HOME || '继承系统默认'}`
+    `Runner CODEX_HOME：${RUNNER_CODEX_HOME || '继承系统默认'}`,
+    `Codex 上下文窗口：${formatCodexConfigValue(contextWindow, {
+      overridden: Boolean(CODEX_CONTEXT_WINDOW_OVERRIDE)
+    })}`,
+    `Codex 自动压缩阈值：${formatCodexConfigValue(autoCompactTokenLimit, {
+      overridden: Boolean(CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE)
+    })}`,
+    `自动压缩状态：${getCodexAutoCompactStatus()}`
   ].join('\n');
 }
 
@@ -1796,6 +1923,7 @@ function getQueueMessage() {
 
 function getSessionMessage(context) {
   const currentSession = getSessionForContext(context);
+  const autoCompactTokenLimit = getEffectiveCodexAutoCompactTokenLimit();
   return [
     '会话状态：',
     `当前会话键：${currentSession.scopeKey}`,
@@ -1808,6 +1936,9 @@ function getSessionMessage(context) {
     `工作目录：${runnerState.workdir}`,
     `权限模式：${VALID_ACCESS_MODES.get(runnerState.accessMode).label}`,
     `Runner CODEX_HOME：${RUNNER_CODEX_HOME || '继承系统默认'}`,
+    `Codex 自动压缩阈值：${formatCodexConfigValue(autoCompactTokenLimit, {
+      overridden: Boolean(CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE)
+    })}`,
     pendingApproval ? `待审批命令：${pendingApproval.command}` : null
   ].filter(Boolean).join('\n');
 }
@@ -1933,6 +2064,12 @@ function buildCodexArgs(prompt, outputFile, session, workdir) {
   const accessConfig = VALID_ACCESS_MODES.get(runnerState.accessMode) || VALID_ACCESS_MODES.get('safe');
   args.push('-C', workdir);
   args.push('-s', accessConfig.sandbox);
+  if (CODEX_CONTEXT_WINDOW_OVERRIDE) {
+    args.push('-c', `model_context_window=${CODEX_CONTEXT_WINDOW_OVERRIDE}`);
+  }
+  if (CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE) {
+    args.push('-c', `model_auto_compact_token_limit=${CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE}`);
+  }
   for (const addDir of runnerState.addDirs) {
     args.push('--add-dir', addDir);
   }
@@ -2204,9 +2341,10 @@ async function executeTask(task) {
   await safeSendReply(task.context, `开始执行，队列剩余 ${taskQueue.length} 条。`);
 
   try {
+    const includePolicy = !(session.hasConversation && session.threadId);
     const prompt = task.kind === 'approval'
-      ? buildApprovalPrompt(task.action, pendingApproval)
-      : buildUserPrompt(task.input);
+      ? buildApprovalPrompt(task.action, pendingApproval, { includePolicy })
+      : buildUserPrompt(task.input, { includePolicy });
 
     const reply = await runCodexExec(prompt, session, task.workdir);
     if (!reply) {

@@ -58,6 +58,7 @@ RUNNER_WORKDIR=.
 RUNNER_ADD_DIRS=./workspace,./shared
 CODEX_ACCESS_MODE=safe
 CODEX_EXEC_TIMEOUT_MS=1800000
+CODEX_AUTO_COMPACT_TOKEN_LIMIT=200000
 WEIXIN_ENABLED=true
 WEIXIN_ACCOUNT_ID=default
 WEIXIN_BASE_URL=
@@ -70,8 +71,10 @@ WEIXIN_BOT_TYPE=3
 - `RUNNER_WORKDIR` 是首次启动或没有运行时状态文件时的默认目录
 - 一旦 runner 已运行过，后续进程重启会优先恢复上次保存的工作目录和权限模式
 - `CODEX_EXEC_TIMEOUT_MS` 表示“无新输出超时”，不是固定总时长；设为 `0` 可禁用
+- `CODEX_AUTO_COMPACT_TOKEN_LIMIT` 会覆盖 runner 会话的 Codex 自动压缩阈值；如果你的 `config.toml` 里把阈值设得很高，比如 `900000 / 1000000`，聊天里看起来就会像“几乎不压缩”
 - `RUNNER_CODEX_HOME` 用于让 runner 使用独立的 Codex 状态目录，避免和你手动开的 `codex` 混用 `resume --last`
   runner 在首次初始化该目录时，会从现有 `CODEX_HOME` 复制必要配置文件（如 `auth.json`、`config.toml`），避免出现 API key 或 base URL 缺失
+- `/status` 和 `/session` 会显示当前 runner 看到的上下文窗口与自动压缩阈值，便于排查“为什么还没触发压缩”
 - `WEIXIN_*` 配置控制微信长轮询接入；当前先支持文本收发
 - 服务运行中执行扫码登录命令后，微信客户端会自动热加载，无需重启 runner
 - 微信可以通过扫码登录写入本地凭证，登录后无需手工填写 `WEIXIN_TOKEN`
@@ -126,6 +129,7 @@ QQ_BOT_SECRET=your_app_secret
 CODEX_BIN=./bin/codex
 CODEX_HOME=../.codex
 RUNNER_CODEX_HOME=../.codex-qq-runner
+CODEX_AUTO_COMPACT_TOKEN_LIMIT=200000
 WEIXIN_ENABLED=true
 WEIXIN_ACCOUNT_ID=default
 WEIXIN_BOT_TYPE=3
