@@ -957,6 +957,16 @@ function parseExecJsonEvents(output) {
   return events;
 }
 
+function parseExecJsonEventLine(line) {
+  const normalized = sanitizeText(line);
+  if (!normalized) return null;
+  try {
+    return JSON.parse(normalized);
+  } catch (_) {
+    return null;
+  }
+}
+
 function normalizeTokenUsage(value) {
   if (!value || typeof value !== 'object') return null;
 
@@ -1082,6 +1092,120 @@ function formatTokenUsage(usage) {
   }
   parts.push(`合计 ${formatTokenNumber(normalized.totalTokens)}`);
   return parts.join('，');
+}
+
+function compactWhitespace(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+function summarizeCommandForProgress(commandText) {
+  const normalized = compactWhitespace(commandText);
+  if (!normalized) return '正在执行终端命令';
+  if (normalized.length <= 80) {
+    return `正在执行命令：${normalized}`;
+  }
+  return `正在执行命令：${normalized.slice(0, 77)}...`;
+}
+
+function describeFunctionCallForProgress(name, argumentsText) {
+  const normalizedName = sanitizeText(name);
+  if (!normalizedName) return '';
+
+  if (normalizedName === 'exec_command') {
+    try {
+      const parsed = JSON.parse(argumentsText || '{}');
+      return summarizeCommandForProgress(parsed.cmd);
+    } catch (_) {
+      return '正在执行终端命令';
+    }
+  }
+
+  if (normalizedName === 'write_stdin') {
+    return '正在等待终端命令输出';
+  }
+  if (normalizedName === 'apply_patch') {
+    return '正在修改文件';
+  }
+  if (normalizedName === 'parallel') {
+    return '正在并行收集信息';
+  }
+  if (normalizedName === 'spawn_agent') {
+    return '正在分派子任务';
+  }
+  if (normalizedName === 'wait_agent') {
+    return '正在等待子任务结果';
+  }
+  if (normalizedName === 'send_input') {
+    return '正在向子任务补充信息';
+  }
+  if (normalizedName === 'open' || normalizedName === 'click' || normalizedName === 'find') {
+    return '正在读取页面内容';
+  }
+  if (normalizedName === 'search_query' || normalizedName === 'image_query') {
+    return '正在搜索资料';
+  }
+  if (normalizedName === 'finance') {
+    return '正在查询行情';
+  }
+  if (normalizedName === 'weather') {
+    return '正在查询天气';
+  }
+  if (normalizedName === 'sports') {
+    return '正在查询赛程数据';
+  }
+  if (normalizedName === 'time') {
+    return '正在查询时间信息';
+  }
+
+  return `正在调用工具：${normalizedName}`;
+}
+
+function extractProgressUpdateFromExecEvent(event) {
+  if (!event || typeof event !== 'object') return null;
+
+  if (sanitizeText(event.type) === 'event_msg') {
+    const payload = event.payload;
+    if (!payload || typeof payload !== 'object') return null;
+
+    if (sanitizeText(payload.type) === 'agent_message' && sanitizeText(payload.phase) === 'commentary') {
+      const message = sanitizeText(payload.message);
+      if (!message) return null;
+      return {
+        message,
+        activitySummary: compactWhitespace(message)
+      };
+    }
+
+    if (sanitizeText(payload.type) === 'task_started') {
+      return {
+        message: '',
+        activitySummary: '任务已启动，正在整理上下文'
+      };
+    }
+
+    return null;
+  }
+
+  if (sanitizeText(event.type) === 'response_item') {
+    const payload = event.payload;
+    if (!payload || typeof payload !== 'object') return null;
+    if (sanitizeText(payload.type) !== 'function_call') return null;
+
+    const activitySummary = describeFunctionCallForProgress(payload.name, payload.arguments);
+    if (!activitySummary) return null;
+    return {
+      message: '',
+      activitySummary
+    };
+  }
+
+  return null;
+}
+
+function formatProgressReply(message) {
+  const normalized = sanitizeText(message);
+  if (!normalized) return '';
+  return `进度：\n${normalized}`;
 }
 
 function parseApprovalRequest(message) {
@@ -1254,6 +1378,7 @@ let qqBot = null;
 const WEIXIN_ENABLED = parseBoolean(process.env.WEIXIN_ENABLED, true);
 
 const MAX_BOT_MESSAGE_LENGTH = 1500;
+const PROGRESS_HEARTBEAT_INTERVAL_MS = 25 * 1000;
 const DEFAULT_EXEC_TIMEOUT_MS = 30 * 60 * 1000;
 const RAW_EXEC_TIMEOUT_MS = Number(process.env.CODEX_EXEC_TIMEOUT_MS);
 const EXEC_TIMEOUT_MS = Number.isFinite(RAW_EXEC_TIMEOUT_MS)
@@ -2271,6 +2396,59 @@ async function safeSendReply(context, content) {
   }
 }
 
+function createProgressReporter(context) {
+  let closed = false;
+  let lastSentMessage = '';
+  let lastSentAt = 0;
+  let lastActivitySummary = '仍在处理中，请稍候。';
+  let sendChain = Promise.resolve();
+  let heartbeatTimer = null;
+
+  const queueSend = (message, options = {}) => {
+    const normalized = sanitizeText(message);
+    if (!normalized || closed) return;
+    if (!options.force && normalized === lastSentMessage) return;
+
+    sendChain = sendChain
+      .catch(() => {})
+      .then(async () => {
+        if (closed) return;
+        lastSentMessage = normalized;
+        lastSentAt = Date.now();
+        await safeSendReply(context, normalized);
+      });
+  };
+
+  return {
+    start() {
+      if (heartbeatTimer) return;
+      heartbeatTimer = setInterval(() => {
+        if (closed) return;
+        if (Date.now() - lastSentAt < PROGRESS_HEARTBEAT_INTERVAL_MS) return;
+        queueSend(formatProgressReply(lastActivitySummary), { force: true });
+      }, PROGRESS_HEARTBEAT_INTERVAL_MS);
+    },
+    handleEvent(event) {
+      const progress = extractProgressUpdateFromExecEvent(event);
+      if (!progress) return;
+      if (sanitizeText(progress.activitySummary)) {
+        lastActivitySummary = sanitizeText(progress.activitySummary);
+      }
+      if (sanitizeText(progress.message)) {
+        queueSend(formatProgressReply(progress.message));
+      }
+    },
+    async stop() {
+      closed = true;
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+      await sendChain.catch(() => {});
+    }
+  };
+}
+
 function buildCodexArgs(prompt, outputFile, session, workdir) {
   const args = ['exec'];
   const accessConfig = VALID_ACCESS_MODES.get(runnerState.accessMode) || VALID_ACCESS_MODES.get('safe');
@@ -2297,11 +2475,12 @@ function buildCodexArgs(prompt, outputFile, session, workdir) {
   return args;
 }
 
-function runCodexExec(prompt, session, workdir) {
+function runCodexExec(prompt, session, workdir, context) {
   return new Promise((resolve, reject) => {
     const generation = session.generation;
     const outputFile = path.join(os.tmpdir(), `qq-codex-runner-last-${process.pid}-${Date.now()}.txt`);
     const args = buildCodexArgs(prompt, outputFile, session, workdir);
+    const progressReporter = createProgressReporter(context);
     const child = childProcess.spawn(command, args, {
       cwd: workdir,
       env: {
@@ -2317,6 +2496,7 @@ function runCodexExec(prompt, session, workdir) {
     codexProcess.session = session;
 
     let stdout = '';
+    let stdoutBuffer = '';
     let stderr = '';
     let settled = false;
     let timeout = null;
@@ -2340,23 +2520,40 @@ function runCodexExec(prompt, session, workdir) {
         codexProcess.busy = false;
         codexProcess.session = null;
         if (generation !== session.generation) {
-          resolve(null);
+          void progressReporter.stop().then(() => {
+            resolve(null);
+          });
           return;
         }
-        reject(
-          new Error(
-            `Codex execution timed out after ${Math.floor(
-              EXEC_TIMEOUT_MS / 1000
-            )} seconds without new output. You can increase CODEX_EXEC_TIMEOUT_MS or set it to 0 to disable this timeout.`
-          )
-        );
+        void progressReporter.stop().then(() => {
+          reject(
+            new Error(
+              `Codex execution timed out after ${Math.floor(
+                EXEC_TIMEOUT_MS / 1000
+              )} seconds without new output. You can increase CODEX_EXEC_TIMEOUT_MS or set it to 0 to disable this timeout.`
+            )
+          );
+        });
       }, EXEC_TIMEOUT_MS);
     };
 
     refreshExecTimeout();
+    progressReporter.start();
+
+    const handleStdoutEvent = (event) => {
+      if (!event) return;
+      progressReporter.handleEvent(event);
+    };
 
     child.stdout.on('data', (chunk) => {
-      stdout += String(chunk || '');
+      const text = String(chunk || '');
+      stdout += text;
+      stdoutBuffer += text;
+      const lines = stdoutBuffer.split(/\r?\n/);
+      stdoutBuffer = lines.pop() || '';
+      for (const line of lines) {
+        handleStdoutEvent(parseExecJsonEventLine(line));
+      }
       refreshExecTimeout();
     });
 
@@ -2372,11 +2569,14 @@ function runCodexExec(prompt, session, workdir) {
       codexProcess.child = null;
       codexProcess.busy = false;
       codexProcess.session = null;
-      if (generation !== session.generation) {
-        resolve(null);
-        return;
-      }
-      reject(error);
+      void (async () => {
+        await progressReporter.stop();
+        if (generation !== session.generation) {
+          resolve(null);
+          return;
+        }
+        reject(error);
+      })();
     });
 
     child.on('exit', (code, signal) => {
@@ -2386,56 +2586,60 @@ function runCodexExec(prompt, session, workdir) {
       codexProcess.child = null;
       codexProcess.busy = false;
       codexProcess.session = null;
+      void (async () => {
+        handleStdoutEvent(parseExecJsonEventLine(stdoutBuffer));
+        await progressReporter.stop();
 
-      let finalMessage = '';
-      try {
-        finalMessage = fs.readFileSync(outputFile, 'utf8');
-      } catch (_) {}
-      try {
-        fs.unlinkSync(outputFile);
-      } catch (_) {}
+        let finalMessage = '';
+        try {
+          finalMessage = fs.readFileSync(outputFile, 'utf8');
+        } catch (_) {}
+        try {
+          fs.unlinkSync(outputFile);
+        } catch (_) {}
 
-      if (generation !== session.generation) {
-        resolve(null);
-        return;
-      }
+        if (generation !== session.generation) {
+          resolve(null);
+          return;
+        }
 
-      if (signal) {
-        reject(new Error(`Codex process exited with signal ${signal}.`));
-        return;
-      }
+        if (signal) {
+          reject(new Error(`Codex process exited with signal ${signal}.`));
+          return;
+        }
 
-      if (code !== 0) {
-        reject(new Error(summarizeExecFailure(stderr, stdout)));
-        return;
-      }
+        if (code !== 0) {
+          reject(new Error(summarizeExecFailure(stderr, stdout)));
+          return;
+        }
 
-      const events = parseExecJsonEvents(stdout);
-      const threadId = extractThreadIdFromExecEvents(events);
-      const tokenUsage = extractTokenUsageFromExecEvents(events);
-      if (threadId) {
-        session.threadId = threadId;
-      }
-      if (tokenUsage.lastUsage) {
-        session.lastTokenUsage = tokenUsage.lastUsage;
-      }
-      if (tokenUsage.totalUsage) {
-        session.totalTokenUsage = tokenUsage.totalUsage;
-      } else if (tokenUsage.lastUsage) {
-        session.totalTokenUsage = addTokenUsage(session.totalTokenUsage, tokenUsage.lastUsage);
-      }
-      if (events.length > 0 || sanitizeText(finalMessage)) {
-        session.hasConversation = true;
-        persistRunnerState();
-      }
+        const events = parseExecJsonEvents(stdout);
+        const threadId = extractThreadIdFromExecEvents(events);
+        const tokenUsage = extractTokenUsageFromExecEvents(events);
+        if (threadId) {
+          session.threadId = threadId;
+        }
+        if (tokenUsage.lastUsage) {
+          session.lastTokenUsage = tokenUsage.lastUsage;
+        }
+        if (tokenUsage.totalUsage) {
+          session.totalTokenUsage = tokenUsage.totalUsage;
+        } else if (tokenUsage.lastUsage) {
+          session.totalTokenUsage = addTokenUsage(session.totalTokenUsage, tokenUsage.lastUsage);
+        }
+        if (events.length > 0 || sanitizeText(finalMessage)) {
+          session.hasConversation = true;
+          persistRunnerState();
+        }
 
-      const normalized = sanitizeText(finalMessage);
-      if (!normalized) {
-        reject(new Error('Codex finished without a final reply.'));
-        return;
-      }
+        const normalized = sanitizeText(finalMessage);
+        if (!normalized) {
+          reject(new Error('Codex finished without a final reply.'));
+          return;
+        }
 
-      resolve(normalized);
+        resolve(normalized);
+      })();
     });
   });
 }
@@ -2567,7 +2771,7 @@ async function executeTask(task) {
       ? buildApprovalPrompt(task.action, pendingApproval, { includePolicy })
       : buildUserPrompt(task.input, { includePolicy });
 
-    const reply = await runCodexExec(prompt, session, task.workdir);
+    const reply = await runCodexExec(prompt, session, task.workdir, task.context);
     if (!reply) {
       return;
     }
