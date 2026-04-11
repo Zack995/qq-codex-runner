@@ -1163,6 +1163,30 @@ function describeFunctionCallForProgress(name, argumentsText) {
 function extractProgressUpdateFromExecEvent(event) {
   if (!event || typeof event !== 'object') return null;
 
+  if (sanitizeText(event.type) === 'item.started' || sanitizeText(event.type) === 'item.completed') {
+    const item = event.item;
+    if (!item || typeof item !== 'object') return null;
+
+    if (sanitizeText(item.type) === 'agent_message') {
+      const message = sanitizeText(item.text);
+      if (!message) return null;
+      return {
+        kind: 'agent_message',
+        message,
+        activitySummary: compactWhitespace(message)
+      };
+    }
+
+    if (sanitizeText(item.type) === 'command_execution') {
+      const summary = summarizeCommandForProgress(item.command);
+      return {
+        kind: 'command_execution',
+        message: '',
+        activitySummary: summary
+      };
+    }
+  }
+
   if (sanitizeText(event.type) === 'event_msg') {
     const payload = event.payload;
     if (!payload || typeof payload !== 'object') return null;
@@ -1171,6 +1195,7 @@ function extractProgressUpdateFromExecEvent(event) {
       const message = sanitizeText(payload.message);
       if (!message) return null;
       return {
+        kind: 'agent_message',
         message,
         activitySummary: compactWhitespace(message)
       };
@@ -1178,6 +1203,7 @@ function extractProgressUpdateFromExecEvent(event) {
 
     if (sanitizeText(payload.type) === 'task_started') {
       return {
+        kind: 'task_started',
         message: '',
         activitySummary: '任务已启动，正在整理上下文'
       };
@@ -1194,6 +1220,7 @@ function extractProgressUpdateFromExecEvent(event) {
     const activitySummary = describeFunctionCallForProgress(payload.name, payload.arguments);
     if (!activitySummary) return null;
     return {
+      kind: 'function_call',
       message: '',
       activitySummary
     };
@@ -2401,6 +2428,7 @@ function createProgressReporter(context) {
   let lastSentMessage = '';
   let lastSentAt = 0;
   let lastActivitySummary = '仍在处理中，请稍候。';
+  let sawCommandExecution = false;
   let sendChain = Promise.resolve();
   let heartbeatTimer = null;
 
@@ -2434,7 +2462,13 @@ function createProgressReporter(context) {
       if (sanitizeText(progress.activitySummary)) {
         lastActivitySummary = sanitizeText(progress.activitySummary);
       }
+      if (progress.kind === 'command_execution') {
+        sawCommandExecution = true;
+      }
       if (sanitizeText(progress.message)) {
+        if (progress.kind === 'agent_message' && sawCommandExecution) {
+          return;
+        }
         queueSend(formatProgressReply(progress.message));
       }
     },
