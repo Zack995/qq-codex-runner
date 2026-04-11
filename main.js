@@ -957,6 +957,95 @@ function parseExecJsonEvents(output) {
   return events;
 }
 
+function normalizeTokenUsage(value) {
+  if (!value || typeof value !== 'object') return null;
+
+  const inputTokens = Math.max(0, Number(value.input_tokens ?? value.inputTokens ?? 0) || 0);
+  const cachedInputTokens = Math.max(
+    0,
+    Number(value.cached_input_tokens ?? value.cachedInputTokens ?? 0) || 0
+  );
+  const outputTokens = Math.max(0, Number(value.output_tokens ?? value.outputTokens ?? 0) || 0);
+  const reasoningOutputTokens = Math.max(
+    0,
+    Number(value.reasoning_output_tokens ?? value.reasoningOutputTokens ?? 0) || 0
+  );
+  const totalTokens = Math.max(
+    0,
+    Number(value.total_tokens ?? value.totalTokens ?? (inputTokens + outputTokens + reasoningOutputTokens)) || 0
+  );
+
+  if (
+    inputTokens === 0 &&
+    cachedInputTokens === 0 &&
+    outputTokens === 0 &&
+    reasoningOutputTokens === 0 &&
+    totalTokens === 0
+  ) {
+    return null;
+  }
+
+  return {
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+    reasoningOutputTokens,
+    totalTokens
+  };
+}
+
+function addTokenUsage(left, right) {
+  const normalizedLeft = normalizeTokenUsage(left);
+  const normalizedRight = normalizeTokenUsage(right);
+  if (!normalizedLeft && !normalizedRight) return null;
+  if (!normalizedLeft) return normalizedRight;
+  if (!normalizedRight) return normalizedLeft;
+
+  return {
+    inputTokens: normalizedLeft.inputTokens + normalizedRight.inputTokens,
+    cachedInputTokens: normalizedLeft.cachedInputTokens + normalizedRight.cachedInputTokens,
+    outputTokens: normalizedLeft.outputTokens + normalizedRight.outputTokens,
+    reasoningOutputTokens: normalizedLeft.reasoningOutputTokens + normalizedRight.reasoningOutputTokens,
+    totalTokens: normalizedLeft.totalTokens + normalizedRight.totalTokens
+  };
+}
+
+function extractTokenUsageFromExecEvents(events) {
+  const state = {
+    lastUsage: null,
+    totalUsage: null
+  };
+
+  for (const event of events) {
+    if (!event || typeof event !== 'object') continue;
+
+    if (sanitizeText(event.type) === 'turn.completed') {
+      const usage = normalizeTokenUsage(event.usage);
+      if (usage) {
+        state.lastUsage = usage;
+      }
+      continue;
+    }
+
+    const payload = event.payload;
+    if (!payload || typeof payload !== 'object') continue;
+    if (sanitizeText(payload.type) !== 'token_count') continue;
+    const info = payload.info;
+    if (!info || typeof info !== 'object') continue;
+
+    const lastUsage = normalizeTokenUsage(info.last_token_usage || info.lastTokenUsage);
+    const totalUsage = normalizeTokenUsage(info.total_token_usage || info.totalTokenUsage);
+    if (lastUsage) {
+      state.lastUsage = lastUsage;
+    }
+    if (totalUsage) {
+      state.totalUsage = totalUsage;
+    }
+  }
+
+  return state;
+}
+
 function extractThreadIdFromExecEvents(events) {
   for (const event of events) {
     if (!event || typeof event !== 'object') continue;
@@ -971,6 +1060,28 @@ function summarizeExecFailure(stderr, stdout) {
   const combined = sanitizeText([stderr, stdout].filter(Boolean).join('\n'));
   if (!combined) return 'Codex did not return readable output.';
   return combined.split('\n').slice(-12).join('\n');
+}
+
+function formatTokenNumber(value) {
+  return Number(value || 0).toLocaleString('en-US');
+}
+
+function formatTokenUsage(usage) {
+  const normalized = normalizeTokenUsage(usage);
+  if (!normalized) return '暂无';
+
+  const parts = [
+    `输入 ${formatTokenNumber(normalized.inputTokens)}`
+  ];
+  if (normalized.cachedInputTokens > 0) {
+    parts[0] += `（缓存 ${formatTokenNumber(normalized.cachedInputTokens)}）`;
+  }
+  parts.push(`输出 ${formatTokenNumber(normalized.outputTokens)}`);
+  if (normalized.reasoningOutputTokens > 0) {
+    parts.push(`推理 ${formatTokenNumber(normalized.reasoningOutputTokens)}`);
+  }
+  parts.push(`合计 ${formatTokenNumber(normalized.totalTokens)}`);
+  return parts.join('，');
 }
 
 function parseApprovalRequest(message) {
@@ -1252,6 +1363,12 @@ function getCodexConfigFilePath() {
   return path.join(configHome, 'config.toml');
 }
 
+function getCodexSessionsDirPath() {
+  const configHome = RUNNER_CODEX_HOME || PRIMARY_CODEX_HOME;
+  if (!configHome) return '';
+  return path.join(configHome, 'sessions');
+}
+
 function getEffectiveCodexContextWindow() {
   if (CODEX_CONTEXT_WINDOW_OVERRIDE) return CODEX_CONTEXT_WINDOW_OVERRIDE;
   return parsePositiveInteger(readTopLevelTomlValue(getCodexConfigFilePath(), 'model_context_window'));
@@ -1296,8 +1413,57 @@ function createCodexSessionState(scopeKey, workdir) {
     workdir: resolveInputPath(workdir),
     hasConversation: false,
     threadId: null,
-    generation: 0
+    generation: 0,
+    lastTokenUsage: null,
+    totalTokenUsage: null
   };
+}
+
+function findCodexRolloutFileByThreadId(threadId) {
+  const normalizedThreadId = sanitizeText(threadId);
+  const sessionsDir = getCodexSessionsDirPath();
+  if (!normalizedThreadId || !sessionsDir) return '';
+
+  const targetSuffix = `${normalizedThreadId}.jsonl`;
+  const stack = [sessionsDir];
+
+  while (stack.length > 0) {
+    const currentDir = stack.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(currentDir, { withFileTypes: true });
+    } catch (_) {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (entry.name.endsWith(targetSuffix)) {
+        return fullPath;
+      }
+    }
+  }
+
+  return '';
+}
+
+function loadPersistedTokenUsageByThreadId(threadId) {
+  const rolloutFile = findCodexRolloutFileByThreadId(threadId);
+  if (!rolloutFile) return { lastUsage: null, totalUsage: null };
+
+  let content = '';
+  try {
+    content = fs.readFileSync(rolloutFile, 'utf8');
+  } catch (_) {
+    return { lastUsage: null, totalUsage: null };
+  }
+
+  return extractTokenUsageFromExecEvents(parseExecJsonEvents(content));
 }
 
 function loadPersistedRunnerState() {
@@ -1564,12 +1730,19 @@ function hydratePersistedCodexSessions(persistedState) {
     if (!scopeKey || !threadId || !resolvedWorkdir) continue;
 
     const key = buildSessionIdentity(scopeKey, resolvedWorkdir);
+    const persistedLastTokenUsage = normalizeTokenUsage(record.lastTokenUsage || record.last_token_usage);
+    const persistedTotalTokenUsage = normalizeTokenUsage(record.totalTokenUsage || record.total_token_usage);
+    const hydratedTokenUsage = (!persistedLastTokenUsage && !persistedTotalTokenUsage)
+      ? loadPersistedTokenUsageByThreadId(threadId)
+      : { lastUsage: persistedLastTokenUsage, totalUsage: persistedTotalTokenUsage };
     codexSessions.set(key, {
       scopeKey,
       workdir: resolvedWorkdir,
       hasConversation: true,
       threadId,
-      generation: 0
+      generation: 0,
+      lastTokenUsage: normalizeTokenUsage(hydratedTokenUsage.lastUsage),
+      totalTokenUsage: normalizeTokenUsage(hydratedTokenUsage.totalUsage)
     });
   }
 }
@@ -1591,6 +1764,37 @@ function countActiveSessions() {
   return count;
 }
 
+function ensureSessionTokenUsage(session, options = {}) {
+  if (!session || !session.threadId) {
+    return {
+      lastUsage: normalizeTokenUsage(session && session.lastTokenUsage),
+      totalUsage: normalizeTokenUsage(session && session.totalTokenUsage)
+    };
+  }
+
+  let updated = false;
+  if (!normalizeTokenUsage(session.lastTokenUsage) || !normalizeTokenUsage(session.totalTokenUsage)) {
+    const hydratedTokenUsage = loadPersistedTokenUsageByThreadId(session.threadId);
+    if (!normalizeTokenUsage(session.lastTokenUsage) && hydratedTokenUsage.lastUsage) {
+      session.lastTokenUsage = hydratedTokenUsage.lastUsage;
+      updated = true;
+    }
+    if (!normalizeTokenUsage(session.totalTokenUsage) && hydratedTokenUsage.totalUsage) {
+      session.totalTokenUsage = hydratedTokenUsage.totalUsage;
+      updated = true;
+    }
+  }
+
+  if (updated && options.persist !== false) {
+    persistRunnerState();
+  }
+
+  return {
+    lastUsage: normalizeTokenUsage(session.lastTokenUsage),
+    totalUsage: normalizeTokenUsage(session.totalTokenUsage)
+  };
+}
+
 function buildPersistedRunnerState() {
   const sessionRecords = [];
   for (const session of codexSessions.values()) {
@@ -1598,7 +1802,9 @@ function buildPersistedRunnerState() {
       sessionRecords.push({
         scopeKey: session.scopeKey,
         workdir: session.workdir,
-        threadId: session.threadId
+        threadId: session.threadId,
+        lastTokenUsage: normalizeTokenUsage(session.lastTokenUsage),
+        totalTokenUsage: normalizeTokenUsage(session.totalTokenUsage)
       });
     }
   }
@@ -1649,6 +1855,8 @@ function resetSessionState(session) {
   if (!session) return;
   session.hasConversation = false;
   session.threadId = null;
+  session.lastTokenUsage = null;
+  session.totalTokenUsage = null;
   session.generation += 1;
 }
 
@@ -1887,6 +2095,7 @@ function getHelpMessage() {
 
 function getStatusMessage(context) {
   const currentSession = getSessionForContext(context);
+  const tokenUsage = ensureSessionTokenUsage(currentSession);
   const contextWindow = getEffectiveCodexContextWindow();
   const autoCompactTokenLimit = getEffectiveCodexAutoCompactTokenLimit();
   return [
@@ -1908,7 +2117,8 @@ function getStatusMessage(context) {
     `Codex 自动压缩阈值：${formatCodexConfigValue(autoCompactTokenLimit, {
       overridden: Boolean(CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE)
     })}`,
-    `自动压缩状态：${getCodexAutoCompactStatus()}`
+    `自动压缩状态：${getCodexAutoCompactStatus()}`,
+    `最近一轮 Token：${formatTokenUsage(tokenUsage.lastUsage)}`
   ].join('\n');
 }
 
@@ -1923,6 +2133,7 @@ function getQueueMessage() {
 
 function getSessionMessage(context) {
   const currentSession = getSessionForContext(context);
+  const tokenUsage = ensureSessionTokenUsage(currentSession);
   const autoCompactTokenLimit = getEffectiveCodexAutoCompactTokenLimit();
   return [
     '会话状态：',
@@ -1939,6 +2150,7 @@ function getSessionMessage(context) {
     `Codex 自动压缩阈值：${formatCodexConfigValue(autoCompactTokenLimit, {
       overridden: Boolean(CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE)
     })}`,
+    `最近一轮 Token：${formatTokenUsage(tokenUsage.lastUsage)}`,
     pendingApproval ? `待审批命令：${pendingApproval.command}` : null
   ].filter(Boolean).join('\n');
 }
@@ -2200,8 +2412,17 @@ function runCodexExec(prompt, session, workdir) {
 
       const events = parseExecJsonEvents(stdout);
       const threadId = extractThreadIdFromExecEvents(events);
+      const tokenUsage = extractTokenUsageFromExecEvents(events);
       if (threadId) {
         session.threadId = threadId;
+      }
+      if (tokenUsage.lastUsage) {
+        session.lastTokenUsage = tokenUsage.lastUsage;
+      }
+      if (tokenUsage.totalUsage) {
+        session.totalTokenUsage = tokenUsage.totalUsage;
+      } else if (tokenUsage.lastUsage) {
+        session.totalTokenUsage = addTokenUsage(session.totalTokenUsage, tokenUsage.lastUsage);
       }
       if (events.length > 0 || sanitizeText(finalMessage)) {
         session.hasConversation = true;
