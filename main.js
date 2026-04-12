@@ -2453,7 +2453,7 @@ function createProgressReporter(context) {
       heartbeatTimer = setInterval(() => {
         if (closed) return;
         if (Date.now() - lastSentAt < PROGRESS_HEARTBEAT_INTERVAL_MS) return;
-        queueSend(formatProgressReply(lastActivitySummary), { force: true });
+        queueSend(formatProgressReply(lastActivitySummary));
       }, PROGRESS_HEARTBEAT_INTERVAL_MS);
     },
     handleEvent(event) {
