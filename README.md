@@ -170,7 +170,7 @@ node main.js --weixin-logout --weixin-account default
 - `/cwd <编号>`
   选择最近一次搜索结果
 - `/access <read|write|safe|full>`
-  切换权限模式（同时影响 codex sandbox 与 claude permission-mode）
+  切换权限模式并清空队列；现有会话保留，下一条消息以新权限继续（同时影响 codex sandbox 与 claude permission-mode）
 - `/backend`
   查看当前聊天的后端，并检测 codex / claude 两个 CLI 的可用性
 - `/backend <codex|claude>`
@@ -195,7 +195,7 @@ node main.js --weixin-logout --weixin-account default
 - 运行时若 stderr 命中 `401 / unauthorized / invalid api key / not logged in / credential` 等关键词，错误回复会追加对应 CLI 的排查提示
 - 执行中会转发命令执行摘要和工具调用摘要；长时间无新事件才补低频心跳
 - 最终仍只回一次正式答复，避免把中间过程和最终结论混在一起
-- `/access` 切换权限模式时会清空队列并重置全部会话
+- `/access` 切换权限模式时会清空队列并终止正在运行的任务，但现有会话保留；下一条消息会以新权限继续
 - `/cwd` 切目录时会清空等待队列；切回旧目录会恢复该目录旧会话
 - Claude Code 的权限走 `--permission-mode`，无 Codex 的 `<approval_request>` 交互审批流程；`/allow` `/skip` `/reject` 仅对 Codex 生效
 

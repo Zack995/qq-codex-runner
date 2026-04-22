@@ -2599,7 +2599,7 @@ function getHelpMessage() {
     '',
     '【权限模式】',
     '/access - 查看当前权限模式',
-    '/access <read|write|safe|full> - 切换权限模式、清空队列、重置所有会话',
+    '/access <read|write|safe|full> - 切换权限模式并清空队列；现有会话保留',
     '  · Codex sandbox：read-only / workspace-write / workspace-write / danger-full-access',
     '  · Claude permission-mode：plan / acceptEdits / acceptEdits / bypassPermissions',
     '',
@@ -3463,12 +3463,11 @@ async function switchAccessMode(context, rawMode) {
   pendingApproval = null;
   taskQueue.length = 0;
   clearRecentWorkdirSearch();
-  codexSessions.clear();
   persistRunnerState();
 
   await safeSendReply(
     context,
-    `权限模式已切换为：${VALID_ACCESS_MODES.get(mode).label}\n已清空等待队列，并重置所有目录会话。`
+    `权限模式已切换为：${VALID_ACCESS_MODES.get(mode).label}\n已清空等待队列并终止正在运行的任务，现有会话保留，下一条消息会以新权限继续。`
   );
 }
 
