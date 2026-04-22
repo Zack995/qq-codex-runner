@@ -1235,6 +1235,142 @@ function formatProgressReply(message) {
   return `进度：\n${normalized}`;
 }
 
+function normalizeClaudeUsage(value) {
+  if (!value || typeof value !== 'object') return null;
+  const input = Math.max(0, Number(value.input_tokens || 0) || 0);
+  const cacheCreation = Math.max(0, Number(value.cache_creation_input_tokens || 0) || 0);
+  const cacheRead = Math.max(0, Number(value.cache_read_input_tokens || 0) || 0);
+  const output = Math.max(0, Number(value.output_tokens || 0) || 0);
+  if (input === 0 && cacheCreation === 0 && cacheRead === 0 && output === 0) return null;
+  return normalizeTokenUsage({
+    input_tokens: input + cacheCreation,
+    cached_input_tokens: cacheRead,
+    output_tokens: output,
+    total_tokens: input + cacheCreation + cacheRead + output
+  });
+}
+
+function extractSessionIdFromClaudeEvents(events) {
+  for (const event of events) {
+    if (!event || typeof event !== 'object') continue;
+    if (sanitizeText(event.type) === 'system' && sanitizeText(event.subtype) === 'init') {
+      const sid = sanitizeText(event.session_id);
+      if (sid) return sid;
+    }
+  }
+  for (const event of events) {
+    if (!event || typeof event !== 'object') continue;
+    if (sanitizeText(event.type) === 'result') {
+      const sid = sanitizeText(event.session_id);
+      if (sid) return sid;
+    }
+  }
+  return null;
+}
+
+function extractFinalMessageFromClaudeEvents(events) {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!event || sanitizeText(event.type) !== 'result') continue;
+    if (event.is_error) return '';
+    const text = sanitizeText(event.result);
+    if (text) return text;
+  }
+  const textParts = [];
+  for (const event of events) {
+    if (!event || sanitizeText(event.type) !== 'assistant') continue;
+    const content = event.message && Array.isArray(event.message.content) ? event.message.content : [];
+    for (const block of content) {
+      if (block && block.type === 'text' && typeof block.text === 'string') {
+        const normalized = sanitizeText(block.text);
+        if (normalized) textParts.push(normalized);
+      }
+    }
+  }
+  return sanitizeText(textParts.join('\n'));
+}
+
+function extractClaudeErrorFromEvents(events) {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!event || sanitizeText(event.type) !== 'result') continue;
+    if (!event.is_error && sanitizeText(event.subtype) !== 'error') continue;
+    return sanitizeText(event.result || event.error || event.message) || 'Claude 返回错误但未提供详细信息';
+  }
+  return '';
+}
+
+function extractTokenUsageFromClaudeEvents(events) {
+  const state = { lastUsage: null, totalUsage: null };
+  for (const event of events) {
+    if (!event || typeof event !== 'object') continue;
+    if (sanitizeText(event.type) === 'result' && event.usage) {
+      const usage = normalizeClaudeUsage(event.usage);
+      if (usage) state.lastUsage = usage;
+    }
+  }
+  return state;
+}
+
+function describeClaudeToolForProgress(name, input) {
+  const tool = sanitizeText(name);
+  if (!tool) return '';
+  if (tool === 'Bash') {
+    if (input && typeof input === 'object') {
+      const cmd = sanitizeText(input.command);
+      if (cmd) return summarizeCommandForProgress(cmd);
+    }
+    return '正在执行终端命令';
+  }
+  if (tool === 'Read') return '正在读取文件';
+  if (tool === 'Edit' || tool === 'MultiEdit' || tool === 'Write' || tool === 'NotebookEdit') {
+    return '正在修改文件';
+  }
+  if (tool === 'Glob' || tool === 'Grep') return '正在搜索文件';
+  if (tool === 'WebFetch') return '正在读取网页';
+  if (tool === 'WebSearch') return '正在搜索资料';
+  if (tool === 'TodoWrite') return '正在更新任务清单';
+  if (tool === 'Task') return '正在分派子任务';
+  if (tool === 'Agent') return '正在分派子代理';
+  return `正在调用工具：${tool}`;
+}
+
+function extractProgressUpdateFromClaudeEvent(event) {
+  if (!event || typeof event !== 'object') return null;
+  const type = sanitizeText(event.type);
+  if (type === 'system' && sanitizeText(event.subtype) === 'init') {
+    return {
+      kind: 'task_started',
+      message: '',
+      activitySummary: '任务已启动，正在整理上下文'
+    };
+  }
+  if (type !== 'assistant') return null;
+  const content = event.message && Array.isArray(event.message.content) ? event.message.content : [];
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue;
+    if (block.type === 'tool_use') {
+      const summary = describeClaudeToolForProgress(block.name, block.input);
+      if (!summary) continue;
+      return {
+        kind: 'command_execution',
+        message: '',
+        activitySummary: summary
+      };
+    }
+    if (block.type === 'text' && typeof block.text === 'string') {
+      const text = sanitizeText(block.text);
+      if (!text) continue;
+      return {
+        kind: 'agent_message',
+        message: '',
+        activitySummary: compactWhitespace(text)
+      };
+    }
+  }
+  return null;
+}
+
 function parseApprovalRequest(message) {
   const match = String(message || '').match(
     /<approval_request>\s*<command>([\s\S]*?)<\/command>\s*<reason>([\s\S]*?)<\/reason>\s*<\/approval_request>/i
@@ -1244,6 +1380,153 @@ function parseApprovalRequest(message) {
   const reason = sanitizeText(match[2]);
   if (!command) return null;
   return { command, reason };
+}
+
+function spawnProbeVersion(bin, args = ['--version'], timeoutMs = BACKEND_PROBE_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = childProcess.spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (error) {
+      resolve({
+        ok: false,
+        error: (error && error.code) || 'SPAWN_FAILED',
+        message: error && error.message ? error.message : String(error)
+      });
+      return;
+    }
+
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { child.kill('SIGKILL'); } catch (_) {}
+      resolve({ ok: false, error: 'TIMEOUT', stdout, stderr });
+    }, timeoutMs);
+
+    child.stdout.on('data', (chunk) => { stdout += String(chunk); });
+    child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+
+    child.on('error', (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        ok: false,
+        error: (error && error.code) || 'ERROR',
+        message: error && error.message ? error.message : String(error),
+        stdout,
+        stderr
+      });
+    });
+
+    child.on('exit', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ ok: code === 0, code, stdout, stderr });
+    });
+  });
+}
+
+function summarizeProbeFailure(probe) {
+  const detail = sanitizeText(probe.message || probe.stderr || probe.stdout || '');
+  if (!detail) return probe.error || 'unknown';
+  return detail.split('\n').slice(-3).join('\n');
+}
+
+async function checkBackendAvailability(backend) {
+  if (backend === 'codex') {
+    const probe = await spawnProbeVersion(command);
+    if (!probe.ok && probe.error === 'ENOENT') {
+      return {
+        ok: false,
+        reason: 'missing_binary',
+        message: `未找到 codex 可执行文件：${command}。请先安装 codex，或设置 CODEX_BIN / --cmd 指向正确路径。`
+      };
+    }
+    if (!probe.ok) {
+      return {
+        ok: false,
+        reason: 'binary_error',
+        message: `codex --version 执行失败：${summarizeProbeFailure(probe)}`
+      };
+    }
+    const authDir = RUNNER_CODEX_HOME || PRIMARY_CODEX_HOME;
+    const authFile = authDir ? path.join(authDir, 'auth.json') : '';
+    const hasAuthFile = (() => {
+      if (!authFile) return false;
+      try { return fs.statSync(authFile).isFile(); } catch (_) { return false; }
+    })();
+    const hasEnvKey = Boolean(sanitizeText(process.env.OPENAI_API_KEY));
+    if (!hasAuthFile && !hasEnvKey) {
+      return {
+        ok: true,
+        warn: 'auth_unknown',
+        message: `codex 已安装，但未检测到凭据（${authFile || '~/.codex/auth.json'} 不存在，且未设置 OPENAI_API_KEY）。如实际已登录可忽略，否则请运行 \`codex login\`。`
+      };
+    }
+    return { ok: true };
+  }
+
+  if (backend === 'claude') {
+    const probe = await spawnProbeVersion(CLAUDE_BIN);
+    if (!probe.ok && probe.error === 'ENOENT') {
+      return {
+        ok: false,
+        reason: 'missing_binary',
+        message: `未找到 claude 可执行文件：${CLAUDE_BIN}。请安装 Claude Code CLI（npm i -g @anthropic-ai/claude-code），或设置 CLAUDE_BIN 指向正确路径。`
+      };
+    }
+    if (!probe.ok) {
+      return {
+        ok: false,
+        reason: 'binary_error',
+        message: `claude --version 执行失败：${summarizeProbeFailure(probe)}`
+      };
+    }
+    const configDir = RUNNER_CLAUDE_HOME || path.join(os.homedir(), '.claude');
+    const credFile = path.join(configDir, '.credentials.json');
+    const hasCredFile = (() => {
+      try { return fs.statSync(credFile).isFile(); } catch (_) { return false; }
+    })();
+    const hasEnvKey = Boolean(sanitizeText(process.env.ANTHROPIC_API_KEY));
+    if (!hasCredFile && !hasEnvKey) {
+      return {
+        ok: true,
+        warn: 'auth_unknown',
+        message: `claude 已安装，但未检测到凭据（${credFile} 不存在，且未设置 ANTHROPIC_API_KEY）。如实际已登录可忽略，否则请运行 \`claude login\`。`
+      };
+    }
+    return { ok: true };
+  }
+
+  return { ok: false, reason: 'unknown_backend', message: `未知后端：${backend}` };
+}
+
+function describeBackendRuntimeError(backend, stderr, stdout) {
+  const combined = sanitizeText([stderr, stdout].filter(Boolean).join('\n')).toLowerCase();
+  if (!combined) return '';
+  const authPatterns = [
+    /\b401\b/,
+    /\b403\b/,
+    /unauthoriz/,
+    /unauthenticat/,
+    /invalid[\s_-]*api[\s_-]*key/,
+    /not\s*logged\s*in/,
+    /please\s*log\s*in/,
+    /authentication\s*failed/,
+    /expired[\s_-]*token/,
+    /credential/
+  ];
+  if (!authPatterns.some((pattern) => pattern.test(combined))) return '';
+  if (backend === 'claude') {
+    return '\n提示：疑似 Claude 认证问题。请运行 `claude login`，或检查 ANTHROPIC_API_KEY / CLAUDE_CONFIG_DIR 是否有效。';
+  }
+  return '\n提示：疑似 Codex 认证问题。请运行 `codex login`，或检查 OPENAI_API_KEY / CODEX_HOME 是否有效。';
 }
 
 function createQQBotClient() {
@@ -1445,6 +1728,24 @@ const VALID_ACCESS_MODES = new Map([
   ['safe', { label: '安全模式', sandbox: 'workspace-write', bypass: false }],
   ['full', { label: '完全访问', sandbox: 'danger-full-access', bypass: true }]
 ]);
+const VALID_BACKENDS = new Set(['codex', 'claude']);
+const BACKEND_LABELS = { codex: 'Codex', claude: 'Claude Code' };
+const DEFAULT_BACKEND = (() => {
+  const raw = sanitizeText(process.env.RUNNER_DEFAULT_BACKEND).toLowerCase();
+  return VALID_BACKENDS.has(raw) ? raw : 'codex';
+})();
+const CLAUDE_BIN = sanitizeText(process.env.CLAUDE_BIN) || 'claude';
+const RUNNER_CLAUDE_HOME = (() => {
+  const raw = sanitizeText(process.env.RUNNER_CLAUDE_HOME || '');
+  return raw ? resolveInputPath(raw) : '';
+})();
+const CLAUDE_PERMISSION_MODE_BY_ACCESS = {
+  read: 'plan',
+  write: 'acceptEdits',
+  safe: 'acceptEdits',
+  full: 'bypassPermissions'
+};
+const BACKEND_PROBE_TIMEOUT_MS = 5000;
 const persistedRunnerState = loadPersistedRunnerState();
 const initialRunnerState = deriveInitialRunnerState(persistedRunnerState);
 
@@ -1460,7 +1761,8 @@ let codexProcess = {
 let runnerState = {
   workdir: initialRunnerState.workdir,
   accessMode: initialRunnerState.accessMode,
-  addDirs: DEFAULT_ADD_DIRS.slice()
+  addDirs: DEFAULT_ADD_DIRS.slice(),
+  backends: { ...(initialRunnerState.backends || {}) }
 };
 let recentWorkdirSearch = {
   query: '',
@@ -1472,8 +1774,9 @@ let runnerStateWatcher = null;
 
 function buildChatTurnPrompt(input, options = {}) {
   const includePolicy = options.includePolicy !== false;
+  const backend = options.backend || 'codex';
   const parts = [];
-  if (includePolicy) {
+  if (includePolicy && backend === 'codex') {
     parts.push(buildAgentPolicyPrompt(), '');
   }
   parts.push(`[User message]\n${input}\n[/User message]`);
@@ -1559,16 +1862,38 @@ if (!VALID_ACCESS_MODES.has(runnerState.accessMode)) {
 hydratePersistedCodexSessions(persistedRunnerState);
 persistRunnerState();
 
-function createCodexSessionState(scopeKey, workdir) {
+function createCodexSessionState(scopeKey, workdir, backend = 'codex') {
+  const normalizedBackend = VALID_BACKENDS.has(backend) ? backend : 'codex';
   return {
     scopeKey,
     workdir: resolveInputPath(workdir),
+    backend: normalizedBackend,
     hasConversation: false,
     threadId: null,
     generation: 0,
     lastTokenUsage: null,
     totalTokenUsage: null
   };
+}
+
+function getActiveBackend(scopeKey) {
+  const key = sanitizeText(scopeKey);
+  if (!key) return DEFAULT_BACKEND;
+  const stored = sanitizeText(
+    runnerState && runnerState.backends ? runnerState.backends[key] : ''
+  ).toLowerCase();
+  if (stored && VALID_BACKENDS.has(stored)) return stored;
+  return DEFAULT_BACKEND;
+}
+
+function setActiveBackend(scopeKey, backend) {
+  const key = sanitizeText(scopeKey);
+  const normalized = sanitizeText(backend).toLowerCase();
+  if (!key || !VALID_BACKENDS.has(normalized)) return;
+  if (!runnerState.backends) {
+    runnerState.backends = {};
+  }
+  runnerState.backends[key] = normalized;
 }
 
 function findCodexRolloutFileByThreadId(threadId) {
@@ -1836,7 +2161,8 @@ function deriveInitialRunnerState(persistedState) {
   const fallbackAccessMode = sanitizeText(process.env.CODEX_ACCESS_MODE || 'safe').toLowerCase();
   const nextState = {
     workdir: DEFAULT_WORKDIR,
-    accessMode: fallbackAccessMode
+    accessMode: fallbackAccessMode,
+    backends: {}
   };
 
   const persistedWorkdir = persistedState ? resolveExistingDirectory(persistedState.workdir) : null;
@@ -1849,11 +2175,22 @@ function deriveInitialRunnerState(persistedState) {
     nextState.accessMode = persistedAccessMode.toLowerCase();
   }
 
+  if (persistedState && persistedState.backends && typeof persistedState.backends === 'object') {
+    for (const [scope, backend] of Object.entries(persistedState.backends)) {
+      const normalizedScope = sanitizeText(scope);
+      const normalizedBackend = sanitizeText(backend).toLowerCase();
+      if (!normalizedScope) continue;
+      if (!VALID_BACKENDS.has(normalizedBackend)) continue;
+      nextState.backends[normalizedScope] = normalizedBackend;
+    }
+  }
+
   return nextState;
 }
 
-function buildSessionIdentity(scopeKey, workdir) {
-  return `${sanitizeText(scopeKey) || 'runner:default'}::${resolveInputPath(workdir)}`;
+function buildSessionIdentity(scopeKey, workdir, backend = 'codex') {
+  const normalizedBackend = VALID_BACKENDS.has(backend) ? backend : 'codex';
+  return `${sanitizeText(scopeKey) || 'runner:default'}::${resolveInputPath(workdir)}::${normalizedBackend}`;
 }
 
 function getContextSessionScopeKey(context) {
@@ -1881,15 +2218,19 @@ function hydratePersistedCodexSessions(persistedState) {
     const resolvedWorkdir = resolveExistingDirectory(record.workdir);
     if (!scopeKey || !threadId || !resolvedWorkdir) continue;
 
-    const key = buildSessionIdentity(scopeKey, resolvedWorkdir);
+    const rawBackend = sanitizeText(record.backend).toLowerCase();
+    const backend = VALID_BACKENDS.has(rawBackend) ? rawBackend : 'codex';
+
+    const key = buildSessionIdentity(scopeKey, resolvedWorkdir, backend);
     const persistedLastTokenUsage = normalizeTokenUsage(record.lastTokenUsage || record.last_token_usage);
     const persistedTotalTokenUsage = normalizeTokenUsage(record.totalTokenUsage || record.total_token_usage);
-    const hydratedTokenUsage = (!persistedLastTokenUsage && !persistedTotalTokenUsage)
+    const hydratedTokenUsage = (!persistedLastTokenUsage && !persistedTotalTokenUsage && backend === 'codex')
       ? loadPersistedTokenUsageByThreadId(threadId)
       : { lastUsage: persistedLastTokenUsage, totalUsage: persistedTotalTokenUsage };
     codexSessions.set(key, {
       scopeKey,
       workdir: resolvedWorkdir,
+      backend,
       hasConversation: true,
       threadId,
       generation: 0,
@@ -1899,11 +2240,12 @@ function hydratePersistedCodexSessions(persistedState) {
   }
 }
 
-function getScopedSession(scopeKey, workdir = runnerState.workdir) {
+function getScopedSession(scopeKey, workdir = runnerState.workdir, backend) {
   const resolvedWorkdir = resolveInputPath(workdir);
-  const key = buildSessionIdentity(scopeKey, resolvedWorkdir);
+  const resolvedBackend = VALID_BACKENDS.has(backend) ? backend : getActiveBackend(scopeKey);
+  const key = buildSessionIdentity(scopeKey, resolvedWorkdir, resolvedBackend);
   if (!codexSessions.has(key)) {
-    codexSessions.set(key, createCodexSessionState(scopeKey, resolvedWorkdir));
+    codexSessions.set(key, createCodexSessionState(scopeKey, resolvedWorkdir, resolvedBackend));
   }
   return codexSessions.get(key);
 }
@@ -1954,6 +2296,7 @@ function buildPersistedRunnerState() {
       sessionRecords.push({
         scopeKey: session.scopeKey,
         workdir: session.workdir,
+        backend: session.backend || 'codex',
         threadId: session.threadId,
         lastTokenUsage: normalizeTokenUsage(session.lastTokenUsage),
         totalTokenUsage: normalizeTokenUsage(session.totalTokenUsage)
@@ -1963,15 +2306,29 @@ function buildPersistedRunnerState() {
 
   sessionRecords.sort((left, right) => {
     if (left.scopeKey === right.scopeKey) {
+      if (left.workdir === right.workdir) {
+        return String(left.backend).localeCompare(String(right.backend));
+      }
       return left.workdir.localeCompare(right.workdir);
     }
     return left.scopeKey.localeCompare(right.scopeKey);
   });
 
+  const sortedBackends = {};
+  if (runnerState.backends && typeof runnerState.backends === 'object') {
+    for (const scope of Object.keys(runnerState.backends).sort()) {
+      const value = sanitizeText(runnerState.backends[scope]).toLowerCase();
+      if (VALID_BACKENDS.has(value)) {
+        sortedBackends[scope] = value;
+      }
+    }
+  }
+
   return {
-    version: 2,
+    version: 3,
     workdir: runnerState.workdir,
     accessMode: runnerState.accessMode,
+    backends: sortedBackends,
     codexSessions: sessionRecords,
     weixin: {
       syncCursor: weixinState.syncCursor,
@@ -2012,8 +2369,8 @@ function resetSessionState(session) {
   session.generation += 1;
 }
 
-function getSessionForContext(context, workdir = runnerState.workdir) {
-  return getScopedSession(getContextSessionScopeKey(context), workdir);
+function getSessionForContext(context, workdir = runnerState.workdir, backend) {
+  return getScopedSession(getContextSessionScopeKey(context), workdir, backend);
 }
 
 function stopActiveCodexProcess(signal = 'SIGTERM') {
@@ -2227,18 +2584,37 @@ function formatWorkdirSearchMessage(query, matches) {
 function getHelpMessage() {
   return [
     '可用指令：',
+    '',
+    '【基础】',
     '/help - 查看帮助',
-    '/status - 查看运行状态',
-    '/queue - 查看当前队列状态',
-    '/session - 查看当前聊天会话在当前工作目录的 Codex 状态',
+    '/status - 查看运行状态（后端、连接、队列、目录、权限、最近 Token）',
+    '/queue - 查看队列状态（当前任务、排队数、后端是否忙碌）',
+    '/session - 查看当前聊天会话：后端、线程/Session ID、Token、待审批',
+    '',
+    '【工作目录】',
     '/cwd - 查看当前工作目录',
-    '/cwd <目录> - 切换到指定目录；切回旧目录会恢复该目录会话',
-    '/cwd <关键字> - 用本地系统搜索目录并展示最多 5 个候选',
+    '/cwd <目录> - 切换工作目录；切回旧目录会恢复该目录会话',
+    '/cwd <关键字> - 搜索本地目录（最多 5 个候选）',
     '/cwd <编号> - 选择最近一次搜索结果中的目录',
+    '',
+    '【权限模式】',
     '/access - 查看当前权限模式',
-    '/access <read|write|safe|full> - 切换权限模式、清空队列并重置所有目录会话',
-    '/new - 重置当前聊天会话在当前工作目录的 Codex 会话',
-    '/restart - 清空队列并重置所有目录会话',
+    '/access <read|write|safe|full> - 切换权限模式、清空队列、重置所有会话',
+    '  · Codex sandbox：read-only / workspace-write / workspace-write / danger-full-access',
+    '  · Claude permission-mode：plan / acceptEdits / acceptEdits / bypassPermissions',
+    '',
+    '【后端切换】',
+    '/backend - 查看当前后端，并检测 codex / claude 两个 CLI 的可用性',
+    '/backend <codex|claude> - 切换当前聊天的后端（按聊天维度独立生效）',
+    '  · 切换前会检测二进制是否可执行；不可执行直接拒绝',
+    '  · 未检测到凭据（auth 文件 / API key）仅警告，不阻断切换',
+    '  · codex 和 claude 在同一聊天下各自保留独立会话，不会互相覆盖',
+    '',
+    '【会话管理】',
+    '/new - 重置当前聊天在当前目录的当前后端会话（另一后端会话不受影响）',
+    '/restart - 清空队列并重置所有会话（不区分后端）',
+    '',
+    '【审批（仅 Codex）】',
     '/allow - 批准待审批命令',
     '/skip - 跳过待审批命令',
     '/reject - 拒绝待审批命令并重置当前目录会话'
@@ -2246,65 +2622,103 @@ function getHelpMessage() {
 }
 
 function getStatusMessage(context) {
-  const currentSession = getSessionForContext(context);
+  const scopeKey = getContextSessionScopeKey(context);
+  const backend = getActiveBackend(scopeKey);
+  const currentSession = getSessionForContext(context, runnerState.workdir, backend);
   const tokenUsage = ensureSessionTokenUsage(currentSession);
-  const contextWindow = getEffectiveCodexContextWindow();
-  const autoCompactTokenLimit = getEffectiveCodexAutoCompactTokenLimit();
-  return [
+  const lines = [
     '运行状态：',
     `QQ 已连接：${qqBot ? (qqBot.ready ? '是' : '否') : '否'}`,
     `微信已启用：${weixinBot ? '是' : '否'}`,
     `微信已连接：${weixinBot ? (weixinBot.ready ? '是' : '否') : '否'}`,
-    `Codex 忙碌中：${codexProcess.busy ? '是' : '否'}`,
+    `当前后端：${BACKEND_LABELS[backend]}`,
+    `后端忙碌中：${codexProcess.busy ? '是' : '否'}`,
     `当前目录会话已建立：${currentSession.hasConversation ? '是' : '否'}`,
     `已缓存目录会话：${countActiveSessions()}`,
     `队列长度：${taskQueue.length}`,
     `存在待审批：${pendingApproval ? '是' : '否'}`,
     `工作目录：${runnerState.workdir}`,
-    `权限模式：${VALID_ACCESS_MODES.get(runnerState.accessMode).label}`,
-    `Runner CODEX_HOME：${RUNNER_CODEX_HOME || '继承系统默认'}`,
-    `Codex 上下文窗口：${formatCodexConfigValue(contextWindow, {
-      overridden: Boolean(CODEX_CONTEXT_WINDOW_OVERRIDE)
-    })}`,
-    `Codex 自动压缩阈值：${formatCodexConfigValue(autoCompactTokenLimit, {
-      overridden: Boolean(CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE)
-    })}`,
-    `自动压缩状态：${getCodexAutoCompactStatus()}`,
-    `最近一轮 Token：${formatTokenUsage(tokenUsage.lastUsage)}`
-  ].join('\n');
+    `权限模式：${VALID_ACCESS_MODES.get(runnerState.accessMode).label}`
+  ];
+
+  if (backend === 'codex') {
+    const contextWindow = getEffectiveCodexContextWindow();
+    const autoCompactTokenLimit = getEffectiveCodexAutoCompactTokenLimit();
+    lines.push(
+      `Runner CODEX_HOME：${RUNNER_CODEX_HOME || '继承系统默认'}`,
+      `Codex 上下文窗口：${formatCodexConfigValue(contextWindow, {
+        overridden: Boolean(CODEX_CONTEXT_WINDOW_OVERRIDE)
+      })}`,
+      `Codex 自动压缩阈值：${formatCodexConfigValue(autoCompactTokenLimit, {
+        overridden: Boolean(CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE)
+      })}`,
+      `自动压缩状态：${getCodexAutoCompactStatus()}`
+    );
+  } else {
+    const permissionMode = CLAUDE_PERMISSION_MODE_BY_ACCESS[runnerState.accessMode] || 'default';
+    lines.push(
+      `Runner CLAUDE_CONFIG_DIR：${RUNNER_CLAUDE_HOME || '继承系统默认'}`,
+      `Claude 权限模式：${permissionMode}`
+    );
+  }
+
+  lines.push(`最近一轮 Token：${formatTokenUsage(tokenUsage.lastUsage)}`);
+  return lines.join('\n');
 }
 
 function getQueueMessage() {
+  const activeBackend = codexProcess.session && codexProcess.session.backend
+    ? BACKEND_LABELS[codexProcess.session.backend] || codexProcess.session.backend
+    : '';
   return [
     '队列状态：',
     `当前执行任务：${activeTask ? (activeTask.kind === 'approval' ? '审批任务' : '普通任务') : '无'}`,
     `排队任务数：${taskQueue.length}`,
-    `Codex 忙碌中：${codexProcess.busy ? '是' : '否'}`
+    `后端忙碌中：${codexProcess.busy ? (activeBackend ? `是（${activeBackend}）` : '是') : '否'}`
   ].join('\n');
 }
 
 function getSessionMessage(context) {
-  const currentSession = getSessionForContext(context);
+  const scopeKey = getContextSessionScopeKey(context);
+  const backend = getActiveBackend(scopeKey);
+  const currentSession = getSessionForContext(context, runnerState.workdir, backend);
   const tokenUsage = ensureSessionTokenUsage(currentSession);
-  const autoCompactTokenLimit = getEffectiveCodexAutoCompactTokenLimit();
-  return [
+  const threadLabel = backend === 'claude' ? 'Session ID' : '线程 ID';
+  const lines = [
     '会话状态：',
     `当前会话键：${currentSession.scopeKey}`,
+    `当前后端：${BACKEND_LABELS[backend]}`,
     `当前目录会话已建立：${currentSession.hasConversation ? '是' : '否'}`,
-    `Codex 忙碌中：${codexProcess.busy ? '是' : '否'}`,
+    `后端忙碌中：${codexProcess.busy ? '是' : '否'}`,
     `当前目录会话代次：${currentSession.generation}`,
-    `当前目录线程 ID：${currentSession.threadId || '无'}`,
+    `当前目录${threadLabel}：${currentSession.threadId || '无'}`,
     `已缓存目录会话：${countActiveSessions()}`,
     `存在待审批：${pendingApproval ? '是' : '否'}`,
     `工作目录：${runnerState.workdir}`,
-    `权限模式：${VALID_ACCESS_MODES.get(runnerState.accessMode).label}`,
-    `Runner CODEX_HOME：${RUNNER_CODEX_HOME || '继承系统默认'}`,
-    `Codex 自动压缩阈值：${formatCodexConfigValue(autoCompactTokenLimit, {
-      overridden: Boolean(CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE)
-    })}`,
-    `最近一轮 Token：${formatTokenUsage(tokenUsage.lastUsage)}`,
-    pendingApproval ? `待审批命令：${pendingApproval.command}` : null
-  ].filter(Boolean).join('\n');
+    `权限模式：${VALID_ACCESS_MODES.get(runnerState.accessMode).label}`
+  ];
+
+  if (backend === 'codex') {
+    const autoCompactTokenLimit = getEffectiveCodexAutoCompactTokenLimit();
+    lines.push(
+      `Runner CODEX_HOME：${RUNNER_CODEX_HOME || '继承系统默认'}`,
+      `Codex 自动压缩阈值：${formatCodexConfigValue(autoCompactTokenLimit, {
+        overridden: Boolean(CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE)
+      })}`
+    );
+  } else {
+    const permissionMode = CLAUDE_PERMISSION_MODE_BY_ACCESS[runnerState.accessMode] || 'default';
+    lines.push(
+      `Runner CLAUDE_CONFIG_DIR：${RUNNER_CLAUDE_HOME || '继承系统默认'}`,
+      `Claude 权限模式：${permissionMode}`
+    );
+  }
+
+  lines.push(`最近一轮 Token：${formatTokenUsage(tokenUsage.lastUsage)}`);
+  if (pendingApproval) {
+    lines.push(`待审批命令：${pendingApproval.command}`);
+  }
+  return lines.join('\n');
 }
 
 function getWorkdirMessage() {
@@ -2423,7 +2837,7 @@ async function safeSendReply(context, content) {
   }
 }
 
-function createProgressReporter(context) {
+function createProgressReporter(context, parseEvent = extractProgressUpdateFromExecEvent) {
   let closed = false;
   let lastSentMessage = '';
   let lastSentAt = 0;
@@ -2457,7 +2871,7 @@ function createProgressReporter(context) {
       }, PROGRESS_HEARTBEAT_INTERVAL_MS);
     },
     handleEvent(event) {
-      const progress = extractProgressUpdateFromExecEvent(event);
+      const progress = parseEvent(event);
       if (!progress) return;
       if (sanitizeText(progress.activitySummary)) {
         lastActivitySummary = sanitizeText(progress.activitySummary);
@@ -2643,7 +3057,8 @@ function runCodexExec(prompt, session, workdir, context) {
         }
 
         if (code !== 0) {
-          reject(new Error(summarizeExecFailure(stderr, stdout)));
+          const hint = describeBackendRuntimeError('codex', stderr, stdout);
+          reject(new Error(summarizeExecFailure(stderr, stdout) + hint));
           return;
         }
 
@@ -2678,6 +3093,221 @@ function runCodexExec(prompt, session, workdir, context) {
   });
 }
 
+function buildClaudeArgs(prompt, session, workdir) {
+  void workdir;
+  const args = ['-p', '--output-format', 'stream-json', '--verbose'];
+  const accessMode = runnerState.accessMode;
+  const permissionMode = CLAUDE_PERMISSION_MODE_BY_ACCESS[accessMode] || 'default';
+  args.push('--permission-mode', permissionMode);
+  for (const addDir of runnerState.addDirs) {
+    args.push('--add-dir', addDir);
+  }
+  if (session && session.hasConversation && session.threadId) {
+    args.push('--resume', session.threadId);
+  }
+  args.push(prompt);
+  return args;
+}
+
+function summarizeClaudeFailure(stderr, stdout, events) {
+  const errorMessage = extractClaudeErrorFromEvents(events || []);
+  if (errorMessage) return errorMessage;
+  const combined = sanitizeText([stderr, stdout].filter(Boolean).join('\n'));
+  if (!combined) return 'Claude 未返回可解析的输出。';
+  return combined.split('\n').slice(-12).join('\n');
+}
+
+function runClaudeExec(prompt, session, workdir, context) {
+  return new Promise((resolve, reject) => {
+    const generation = session.generation;
+    const args = buildClaudeArgs(prompt, session, workdir);
+    const progressReporter = createProgressReporter(context, extractProgressUpdateFromClaudeEvent);
+
+    const spawnEnv = {
+      ...process.env,
+      TERM: process.env.TERM || 'xterm-256color'
+    };
+    if (RUNNER_CLAUDE_HOME) {
+      spawnEnv.CLAUDE_CONFIG_DIR = RUNNER_CLAUDE_HOME;
+    }
+
+    let child;
+    try {
+      child = childProcess.spawn(CLAUDE_BIN, args, {
+        cwd: workdir,
+        env: spawnEnv,
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+    } catch (error) {
+      void progressReporter.stop().then(() => {
+        if (error && error.code === 'ENOENT') {
+          reject(new Error(
+            `未找到 claude 可执行文件：${CLAUDE_BIN}。请安装 Claude Code CLI 或设置 CLAUDE_BIN。`
+          ));
+          return;
+        }
+        reject(error);
+      });
+      return;
+    }
+
+    codexProcess.child = child;
+    codexProcess.busy = true;
+    codexProcess.session = session;
+
+    let stdout = '';
+    let stdoutBuffer = '';
+    let stderr = '';
+    let settled = false;
+    let timeout = null;
+
+    const clearExecTimeout = () => {
+      if (!timeout) return;
+      clearTimeout(timeout);
+      timeout = null;
+    };
+
+    const refreshExecTimeout = () => {
+      if (EXEC_TIMEOUT_DISABLED || settled) return;
+      clearExecTimeout();
+      timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try { child.kill('SIGTERM'); } catch (_) {}
+        codexProcess.child = null;
+        codexProcess.busy = false;
+        codexProcess.session = null;
+        if (generation !== session.generation) {
+          void progressReporter.stop().then(() => resolve(null));
+          return;
+        }
+        void progressReporter.stop().then(() => {
+          reject(
+            new Error(
+              `Claude execution timed out after ${Math.floor(
+                EXEC_TIMEOUT_MS / 1000
+              )} seconds without new output. You can increase CODEX_EXEC_TIMEOUT_MS or set it to 0 to disable this timeout.`
+            )
+          );
+        });
+      }, EXEC_TIMEOUT_MS);
+    };
+
+    refreshExecTimeout();
+    progressReporter.start();
+
+    const handleStdoutEvent = (event) => {
+      if (!event) return;
+      progressReporter.handleEvent(event);
+    };
+
+    child.stdout.on('data', (chunk) => {
+      const text = String(chunk || '');
+      stdout += text;
+      stdoutBuffer += text;
+      const lines = stdoutBuffer.split(/\r?\n/);
+      stdoutBuffer = lines.pop() || '';
+      for (const line of lines) {
+        handleStdoutEvent(parseExecJsonEventLine(line));
+      }
+      refreshExecTimeout();
+    });
+
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk || '');
+      refreshExecTimeout();
+    });
+
+    child.on('error', (error) => {
+      if (settled) return;
+      settled = true;
+      clearExecTimeout();
+      codexProcess.child = null;
+      codexProcess.busy = false;
+      codexProcess.session = null;
+      void (async () => {
+        await progressReporter.stop();
+        if (generation !== session.generation) {
+          resolve(null);
+          return;
+        }
+        if (error && error.code === 'ENOENT') {
+          reject(new Error(
+            `未找到 claude 可执行文件：${CLAUDE_BIN}。请安装 Claude Code CLI 或设置 CLAUDE_BIN。`
+          ));
+          return;
+        }
+        reject(error);
+      })();
+    });
+
+    child.on('exit', (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearExecTimeout();
+      codexProcess.child = null;
+      codexProcess.busy = false;
+      codexProcess.session = null;
+      void (async () => {
+        handleStdoutEvent(parseExecJsonEventLine(stdoutBuffer));
+        await progressReporter.stop();
+
+        if (generation !== session.generation) {
+          resolve(null);
+          return;
+        }
+
+        const events = parseExecJsonEvents(stdout);
+
+        if (signal) {
+          reject(new Error(`Claude process exited with signal ${signal}.`));
+          return;
+        }
+
+        const sessionId = extractSessionIdFromClaudeEvents(events);
+        const tokenUsage = extractTokenUsageFromClaudeEvents(events);
+        const claudeError = extractClaudeErrorFromEvents(events);
+        const finalMessage = extractFinalMessageFromClaudeEvents(events);
+
+        if (sessionId) {
+          session.threadId = sessionId;
+        }
+        if (tokenUsage.lastUsage) {
+          session.lastTokenUsage = tokenUsage.lastUsage;
+        }
+        if (tokenUsage.totalUsage) {
+          session.totalTokenUsage = tokenUsage.totalUsage;
+        } else if (tokenUsage.lastUsage) {
+          session.totalTokenUsage = addTokenUsage(session.totalTokenUsage, tokenUsage.lastUsage);
+        }
+        if (events.length > 0 || sanitizeText(finalMessage)) {
+          session.hasConversation = true;
+          persistRunnerState();
+        }
+
+        if (code !== 0) {
+          const hint = describeBackendRuntimeError('claude', stderr, stdout);
+          reject(new Error(summarizeClaudeFailure(stderr, stdout, events) + hint));
+          return;
+        }
+
+        if (claudeError) {
+          const hint = describeBackendRuntimeError('claude', stderr, stdout);
+          reject(new Error(`Claude 返回错误：${claudeError}${hint}`));
+          return;
+        }
+
+        const normalized = sanitizeText(finalMessage);
+        if (!normalized) {
+          reject(new Error('Claude 执行完成但未返回内容。'));
+          return;
+        }
+        resolve(normalized);
+      })();
+    });
+  });
+}
+
 async function resetCodexSession(context) {
   resetSessionState(getSessionForContext(context));
   pendingApproval = null;
@@ -2685,7 +3315,7 @@ async function resetCodexSession(context) {
   stopActiveCodexProcess();
   persistRunnerState();
 
-  await safeSendReply(context, 'Codex 会话已重置，下一条消息会启动新的对话。');
+  await safeSendReply(context, '当前会话已重置，下一条消息会启动新的对话。');
 }
 
 async function restartRunner(context) {
@@ -2762,6 +3392,60 @@ async function handleWorkdirCommand(context, rawDir) {
   await safeSendReply(context, formatWorkdirSearchMessage(target, matches));
 }
 
+function formatBackendCheck(check) {
+  if (!check) return '未知';
+  if (!check.ok) return `不可用（${check.message}）`;
+  if (check.warn) return `可用（警告：${check.message}）`;
+  return '可用';
+}
+
+async function handleBackendCommand(context, rawArg) {
+  const scopeKey = getContextSessionScopeKey(context);
+  const current = getActiveBackend(scopeKey);
+  const normalized = sanitizeText(rawArg).toLowerCase();
+
+  if (!normalized) {
+    const [codexCheck, claudeCheck] = await Promise.all([
+      checkBackendAvailability('codex'),
+      checkBackendAvailability('claude')
+    ]);
+    const lines = [
+      '后端状态：',
+      `当前后端：${BACKEND_LABELS[current]}`,
+      `Codex：${formatBackendCheck(codexCheck)}`,
+      `Claude：${formatBackendCheck(claudeCheck)}`,
+      '切换请发送 /backend codex 或 /backend claude。'
+    ];
+    await safeSendReply(context, lines.join('\n'));
+    return;
+  }
+
+  if (!VALID_BACKENDS.has(normalized)) {
+    await safeSendReply(context, `不支持的后端：${normalized}\n可选：codex / claude`);
+    return;
+  }
+
+  if (normalized === current) {
+    await safeSendReply(context, `当前已是 ${BACKEND_LABELS[normalized]} 后端。`);
+    return;
+  }
+
+  const check = await checkBackendAvailability(normalized);
+  if (!check.ok) {
+    await safeSendReply(context, `切换到 ${BACKEND_LABELS[normalized]} 失败：${check.message}`);
+    return;
+  }
+
+  setActiveBackend(scopeKey, normalized);
+  persistRunnerState();
+  const suffix = check.warn ? `\n注意：${check.message}` : '';
+  const nextSession = getScopedSession(scopeKey, runnerState.workdir, normalized);
+  const sessionHint = nextSession.hasConversation
+    ? `已恢复该后端之前的会话（线程 ${nextSession.threadId || '未知'}）。`
+    : '这是该后端的首次会话，下一条消息会新开对话。';
+  await safeSendReply(context, `已切换到 ${BACKEND_LABELS[normalized]} 后端。\n${sessionHint}${suffix}`);
+}
+
 async function switchAccessMode(context, rawMode) {
   const mode = sanitizeText(rawMode).toLowerCase();
   if (!mode) {
@@ -2790,26 +3474,32 @@ async function switchAccessMode(context, rawMode) {
 
 async function executeTask(task) {
   runnerState.workdir = task.workdir;
-  const session = getScopedSession(task.sessionScopeKey, task.workdir);
+  const backend = task.backend && VALID_BACKENDS.has(task.backend)
+    ? task.backend
+    : getActiveBackend(task.sessionScopeKey);
+  const session = getScopedSession(task.sessionScopeKey, task.workdir, backend);
 
   if (codexProcess.busy) {
-    await safeSendReply(task.context, 'Codex 正在处理上一条消息，请稍候。');
+    await safeSendReply(task.context, `${BACKEND_LABELS[backend]} 正在处理上一条消息，请稍候。`);
     return;
   }
 
-  await safeSendReply(task.context, `开始执行，队列剩余 ${taskQueue.length} 条。`);
+  await safeSendReply(task.context, `开始执行（${BACKEND_LABELS[backend]}），队列剩余 ${taskQueue.length} 条。`);
 
   try {
     const includePolicy = !(session.hasConversation && session.threadId);
     const prompt = task.kind === 'approval'
       ? buildApprovalPrompt(task.action, pendingApproval, { includePolicy })
-      : buildUserPrompt(task.input, { includePolicy });
+      : buildUserPrompt(task.input, { includePolicy, backend });
 
-    const reply = await runCodexExec(prompt, session, task.workdir, task.context);
+    const reply = backend === 'claude'
+      ? await runClaudeExec(prompt, session, task.workdir, task.context)
+      : await runCodexExec(prompt, session, task.workdir, task.context);
     if (!reply) {
       return;
     }
-    const approval = parseApprovalRequest(reply);
+
+    const approval = backend === 'codex' ? parseApprovalRequest(reply) : null;
 
     if (approval) {
       pendingApproval = {
@@ -2817,7 +3507,8 @@ async function executeTask(task) {
         reason: approval.reason,
         context: task.context,
         workdir: task.workdir,
-        sessionScopeKey: task.sessionScopeKey
+        sessionScopeKey: task.sessionScopeKey,
+        backend
       };
       const approvalMessage = [
         '检测到需要审批的操作：',
@@ -2909,6 +3600,11 @@ async function enqueueMessage(eventType, message) {
     return;
   }
 
+  if (commandWord === '/backend') {
+    await handleBackendCommand(context, commandArg);
+    return;
+  }
+
   if (input === '/new') {
     await resetCodexSession(context);
     return;
@@ -2940,7 +3636,8 @@ async function enqueueMessage(eventType, message) {
       input,
       context,
       workdir: pendingApproval.workdir,
-      sessionScopeKey: pendingApproval.sessionScopeKey
+      sessionScopeKey: pendingApproval.sessionScopeKey,
+      backend: pendingApproval.backend || 'codex'
     };
 
     const queuedAhead = activeTask ? 1 : 0;
@@ -2973,7 +3670,8 @@ async function enqueueMessage(eventType, message) {
     input,
     context,
     workdir: runnerState.workdir,
-    sessionScopeKey: context.sessionScopeKey
+    sessionScopeKey: context.sessionScopeKey,
+    backend: getActiveBackend(context.sessionScopeKey)
   };
 
   const queuedAhead = (activeTask ? 1 : 0) + taskQueue.length;
