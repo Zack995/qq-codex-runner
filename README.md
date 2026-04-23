@@ -46,35 +46,79 @@ npm install
 cp .env.example .env
 ```
 
-最少配置（单 QQ 机器人）：
+最少配置只要两行，其它全有默认值：
 
 ```env
 QQ_BOT_APP_ID=your_app_id
 QQ_BOT_SECRET=your_app_secret
 ```
 
-多 QQ 机器人（`QQ_BOTS` 优先于 `QQ_BOT_APP_ID`）：
+见下一节「示例配置」选一个和你场景接近的复制即可。
+
+## 示例配置
+
+### 场景一：单 QQ 机器人 + Codex（最简单）
+
+```env
+QQ_BOT_APP_ID=your_app_id
+QQ_BOT_SECRET=your_app_secret
+# 可选：给机器人起个别称（默认叫 qq机器人）
+QQ_BOT_NAME=主号
+```
+
+### 场景二：Claude Code 作为默认后端
+
+```env
+QQ_BOT_APP_ID=your_app_id
+QQ_BOT_SECRET=your_app_secret
+
+RUNNER_DEFAULT_BACKEND=claude
+CLAUDE_BIN=claude
+# 把 runner 的 Claude 会话目录隔离开，避免和本地手动 claude 串
+RUNNER_CLAUDE_HOME=/Users/you/.claude-runner
+```
+
+### 场景三：多个 QQ 机器人（`QQ_BOTS` 优先于 `QQ_BOT_APP_ID`）
 
 ```env
 QQ_BOTS=[{"id":"main","name":"主号","appId":"111","secret":"aaa"},{"id":"test","name":"测试号","appId":"222","secret":"bbb"}]
 ```
 
-- `id` 是 session 隔离键；多机器人时不同 `id` 下的会话互不影响
-- `name` 是展示用的别称（`/status`、日志里能看到），省略则回落到 `id`
-- 升级前已有的会话若只配一个机器人，启动时会自动迁移到该 `id` 下；配了多个则保守丢弃（参见下文"运行逻辑"）
+- `id` 是会话隔离键；不同 `id` 的会话互不影响
+- `name` 是展示别称（`/status` 和日志里可见），省略时用 `id`
 
-单机器人用 legacy 配置时，别称默认叫 **`qq机器人`**；想改成别的，设 `QQ_BOT_NAME=xxx`。
+### 场景四：多个微信账号
 
-微信支持多账号：
+扫码逐个登录，自动持久化到 `logs/runner-state.json`，下次启动自动拉起：
 
 ```bash
+node main.js --weixin-login --weixin-account default
 node main.js --weixin-login --weixin-account work --weixin-name 工作号
 ```
 
-- 登录成功后下次启动自动拉起
-- `WEIXIN_ACCOUNTS=a,b` 作为白名单只启一部分
-- `WEIXIN_NAMES={"default":"微信机器人","work":"工作号"}` 可在 env 层批量覆盖别称
-- 默认 `default` 账号的别称是 **`微信机器人`**，其他账号默认用 `accountId` 本身
+只想启一部分已登录账号时：
+
+```env
+WEIXIN_ACCOUNTS=default,work
+# 或者用 env 批量改别称（优先级高于 state 里存的）
+WEIXIN_NAMES={"default":"微信机器人","work":"工作号"}
+```
+
+### 场景五：同时支持两家 CLI + 多机器人 + 调并发
+
+```env
+QQ_BOTS=[{"id":"main","name":"主号","appId":"111","secret":"aaa"},{"id":"ops","name":"运维号","appId":"222","secret":"bbb"}]
+CLAUDE_BIN=claude
+RUNNER_CLAUDE_HOME=/Users/you/.claude-runner
+RUNNER_DEFAULT_BACKEND=codex        # 每个聊天可再用 /backend 切
+RUNNER_MAX_CONCURRENCY=5            # 默认 3；机器顶得住可调大
+CODEX_ACCESS_MODE=safe              # codex 和 claude 共用这档
+RUNNER_ADD_DIRS=/workspace,/shared
+```
+
+### 场景六：只给某几个人或某几个群放开
+
+默认不做准入控制（所有人能触达机器人都能用）。如需做 allowlist，建议在 QQ 开放平台侧限制 bot 订阅目标，或自行在 `main.js` 的 `enqueueMessage` 加一层 appId / openid / channelId 白名单检查。
 
 常用配置：
 
@@ -221,15 +265,18 @@ node main.js --weixin-logout --weixin-account default
 
 - 同一工作目录下，QQ、微信和手动终端里的 `codex` / `claude` 默认彼此隔离
 - 同时支持多 QQ 机器人和多微信账号；每条消息带着来源 bot/account 进入队列，回复也由对应 client 发出，不会串号
-- 会话按「bot/account + 对话对象 + 工作目录 + 后端」缓存，任一维度不同就是独立会话（QQ 的 key 形如 `qq:{botId}:channel:X` 或 `qq:{botId}:c2c:X`，微信形如 `weixin:{accountId}:direct:X`）
+- **每个会话（bot/account + 对话对象 + 工作目录 + 后端）独立队列 + 独立执行槽**，互不阻塞；全局并发上限由 `RUNNER_MAX_CONCURRENCY`（默认 3）控制
+- 同一会话内仍然串行，保留 threadId / session_id 的连续性
 - 升级后启动时，若检测到老格式会话（`qq:channel:X` 无 botId）且只配了一个 QQ 机器人，自动迁移到该 `id` 下；配了多个则丢弃老会话并在日志提示
 - Codex 走 `codex exec --json`，复用 `threadId`；Claude 走 `claude -p --output-format stream-json --verbose`，复用 `session_id`
 - `/backend` 切换前会跑 `--version` 自检：不可执行直接拒绝；凭据缺失会附警告但仍允许切换
 - 运行时若 stderr 命中 `401 / unauthorized / invalid api key / not logged in / credential` 等关键词，错误回复会追加对应 CLI 的排查提示
 - 执行中会转发命令执行摘要和工具调用摘要；长时间无新事件才补低频心跳
 - 最终仍只回一次正式答复，避免把中间过程和最终结论混在一起
-- `/access` 切换权限模式时会清空队列并终止正在运行的任务，但现有会话保留；下一条消息会以新权限继续
-- `/cwd` 切目录时会清空等待队列；切回旧目录会恢复该目录旧会话
+- `/access` 切换权限模式是**热切**：已在跑的任务保持旧权限跑完；队列中未开始的任务以及下一条消息以新权限启动；会话保留
+- `/cwd` 切目录也是**热切**：已在跑的任务按原目录跑完；队列中未开始的任务仍以原目录跑；新消息走新目录。切回旧目录会恢复该目录旧会话
+- `/new` 只影响当前聊天（同 scope + workdir + backend）的会话 / 队列 / 待审批；不影响其他 bot / 用户
+- `/restart` 是全局核武：停止所有任务、清空所有队列、重置所有会话
 - Claude Code 的权限走 `--permission-mode`，无 Codex 的 `<approval_request>` 交互审批流程；`/allow` `/skip` `/reject` 仅对 Codex 生效
 
 ## 排查建议

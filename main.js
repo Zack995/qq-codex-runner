@@ -1880,15 +1880,16 @@ const BACKEND_PROBE_TIMEOUT_MS = 5000;
 const persistedRunnerState = loadPersistedRunnerState();
 const initialRunnerState = deriveInitialRunnerState(persistedRunnerState);
 
-const taskQueue = [];
-let activeTask = null;
-let pendingApproval = null;
+const sessionQueues = new Map();    // sessionKey -> task[]
+const activeRuns = new Map();       // sessionKey -> { task, session, child, generation, backend }
+const pendingApprovals = new Map(); // sessionKey -> approval record
 const codexSessions = new Map();
-let codexProcess = {
-  busy: false,
-  child: null,
-  session: null
-};
+const DEFAULT_MAX_CONCURRENCY = 3;
+const RAW_MAX_CONCURRENCY = Number(process.env.RUNNER_MAX_CONCURRENCY);
+const MAX_CONCURRENCY =
+  Number.isFinite(RAW_MAX_CONCURRENCY) && RAW_MAX_CONCURRENCY > 0
+    ? Math.floor(RAW_MAX_CONCURRENCY)
+    : DEFAULT_MAX_CONCURRENCY;
 let runnerState = {
   workdir: initialRunnerState.workdir,
   accessMode: initialRunnerState.accessMode,
@@ -2602,13 +2603,77 @@ function getSessionForContext(context, workdir = runnerState.workdir, backend) {
   return getScopedSession(getContextSessionScopeKey(context), workdir, backend);
 }
 
-function stopActiveCodexProcess(signal = 'SIGTERM') {
-  const child = codexProcess.child;
-  if (!child) return;
-  bumpSessionGeneration(codexProcess.session);
-  try {
-    child.kill(signal);
-  } catch (_) {}
+function stopActiveRun(sessionKey, signal = 'SIGTERM') {
+  const run = activeRuns.get(sessionKey);
+  if (!run) return;
+  if (run.session) bumpSessionGeneration(run.session);
+  if (run.child) {
+    try { run.child.kill(signal); } catch (_) {}
+  }
+}
+
+function stopAllActiveRuns(signal = 'SIGTERM') {
+  for (const sessionKey of Array.from(activeRuns.keys())) {
+    stopActiveRun(sessionKey, signal);
+  }
+}
+
+function anyRunBusy() {
+  return activeRuns.size > 0;
+}
+
+function totalQueuedTasks() {
+  let total = 0;
+  for (const queue of sessionQueues.values()) total += queue.length;
+  return total;
+}
+
+function queueDepthForSession(sessionKey) {
+  const queue = sessionQueues.get(sessionKey);
+  return queue ? queue.length : 0;
+}
+
+function enqueueToSessionQueue(sessionKey, task, options = {}) {
+  if (!sessionQueues.has(sessionKey)) sessionQueues.set(sessionKey, []);
+  const queue = sessionQueues.get(sessionKey);
+  if (options.priority) {
+    queue.unshift(task);
+  } else {
+    queue.push(task);
+  }
+}
+
+function clearQueueForSession(sessionKey) {
+  sessionQueues.delete(sessionKey);
+}
+
+function clearAllQueues() {
+  sessionQueues.clear();
+}
+
+function findPendingApprovalByScope(scopeKey) {
+  const target = sanitizeText(scopeKey);
+  if (!target) return null;
+  for (const [sessionKey, approval] of pendingApprovals.entries()) {
+    if (approval && approval.sessionScopeKey === target) {
+      return { sessionKey, approval };
+    }
+  }
+  return null;
+}
+
+function sessionIdentityForContext(context, backend) {
+  const scopeKey = getContextSessionScopeKey(context);
+  const resolvedBackend = backend || getActiveBackend(scopeKey);
+  return buildSessionIdentity(scopeKey, runnerState.workdir, resolvedBackend);
+}
+
+function sessionIdentityForTask(task) {
+  return buildSessionIdentity(
+    task.sessionScopeKey,
+    task.workdir,
+    task.backend || 'codex'
+  );
 }
 
 function clearRecentWorkdirSearch() {
@@ -2814,39 +2879,24 @@ function getHelpMessage() {
   return [
     '可用指令：',
     '',
-    '【基础】',
-    '/help - 查看帮助',
-    '/status - 查看运行状态（当前接入的 bot/账号别称、所有 QQ 机器人 / 微信账号连接状态、后端、队列、目录、权限、最近 Token）',
-    '/queue - 查看队列状态（当前任务、排队数、后端是否忙碌）',
-    '/session - 查看当前聊天会话：后端、线程/Session ID、Token、待审批',
+    '/help - 帮助',
+    '/status - 运行状态（接入 bot、所有连接、并发槽、目录、权限、Token）',
+    '/queue - 队列状态（并发槽、活跃会话、等待队列）',
+    '/session - 当前会话：后端、线程/Session ID、该会话队列、Token',
     '',
-    '【工作目录】',
     '/cwd - 查看当前工作目录',
-    '/cwd <目录> - 切换工作目录；切回旧目录会恢复该目录会话',
-    '/cwd <关键字> - 搜索本地目录（最多 5 个候选）',
-    '/cwd <编号> - 选择最近一次搜索结果中的目录',
+    '/cwd <目录|关键字|编号> - 切换 / 搜索 / 按编号选择目录（热切）',
     '',
-    '【权限模式】',
     '/access - 查看当前权限模式',
-    '/access <read|write|safe|full> - 切换权限模式并清空队列；现有会话保留',
-    '  · Codex sandbox：read-only / workspace-write / workspace-write / danger-full-access',
-    '  · Claude permission-mode：plan / acceptEdits / acceptEdits / bypassPermissions',
+    '/access <read|write|safe|full> - 热切权限模式（对新任务生效）',
     '',
-    '【后端切换】',
-    '/backend - 查看当前后端，并检测 codex / claude 两个 CLI 的可用性',
-    '/backend <codex|claude> - 切换当前聊天的后端（按聊天维度独立生效）',
-    '  · 切换前会检测二进制是否可执行；不可执行直接拒绝',
-    '  · 未检测到凭据（auth 文件 / API key）仅警告，不阻断切换',
-    '  · codex 和 claude 在同一聊天下各自保留独立会话，不会互相覆盖',
+    '/backend - 查看当前后端 + 检测 codex / claude 可用性',
+    '/backend <codex|claude> - 切换当前聊天的后端（按聊天独立生效）',
     '',
-    '【会话管理】',
-    '/new - 重置当前聊天在当前目录的当前后端会话（另一后端会话不受影响）',
-    '/restart - 清空队列并重置所有会话（不区分后端）',
+    '/new - 重置当前会话（仅影响当前 bot/用户/目录/后端）',
+    '/restart - 停止所有任务、清空所有队列、重置所有会话',
     '',
-    '【审批（仅 Codex）】',
-    '/allow - 批准待审批命令',
-    '/skip - 跳过待审批命令',
-    '/reject - 拒绝待审批命令并重置当前目录会话'
+    '/allow /skip /reject - 审批待确认命令（仅 Codex）'
   ].join('\n');
 }
 
@@ -2872,17 +2922,22 @@ function getStatusMessage(context) {
   const currentClientLabel = context && context.platform === 'weixin'
     ? `微信 ${activeWeixinBot ? activeWeixinBot.name : (activeAccountId || '(未知)')}`
     : `QQ ${activeQQBot ? activeQQBot.name : (activeBotId || '(未知)')}`;
+  const callerSessionKey = sessionIdentityForContext(context, backend);
+  const callerQueueDepth = queueDepthForSession(callerSessionKey);
+  const callerRunActive = activeRuns.has(callerSessionKey);
+  const callerPending = findPendingApprovalByScope(scopeKey);
   const lines = [
     '运行状态：',
     `当前接入：${currentClientLabel}`,
     `QQ 机器人：${formatClientStatuses(qqEntries, '未配置')}`,
     `微信账号：${WEIXIN_ENABLED ? formatClientStatuses(weixinEntries, '无已登录账号') : '已禁用'}`,
     `当前后端：${BACKEND_LABELS[backend]}`,
-    `后端忙碌中：${codexProcess.busy ? '是' : '否'}`,
+    `当前会话是否在跑：${callerRunActive ? '是' : '否'}`,
+    `当前会话队列：${callerQueueDepth}`,
+    `全局并发：${activeRuns.size}/${MAX_CONCURRENCY}（总排队 ${totalQueuedTasks()} 条）`,
     `当前目录会话已建立：${currentSession.hasConversation ? '是' : '否'}`,
     `已缓存目录会话：${countActiveSessions()}`,
-    `队列长度：${taskQueue.length}`,
-    `存在待审批：${pendingApproval ? '是' : '否'}`,
+    `存在待审批（当前聊天）：${callerPending ? '是' : '否'}`,
     `工作目录：${runnerState.workdir}`,
     `权限模式：${VALID_ACCESS_MODES.get(runnerState.accessMode).label}`
   ];
@@ -2913,15 +2968,30 @@ function getStatusMessage(context) {
 }
 
 function getQueueMessage() {
-  const activeBackend = codexProcess.session && codexProcess.session.backend
-    ? BACKEND_LABELS[codexProcess.session.backend] || codexProcess.session.backend
-    : '';
-  return [
+  const lines = [
     '队列状态：',
-    `当前执行任务：${activeTask ? (activeTask.kind === 'approval' ? '审批任务' : '普通任务') : '无'}`,
-    `排队任务数：${taskQueue.length}`,
-    `后端忙碌中：${codexProcess.busy ? (activeBackend ? `是（${activeBackend}）` : '是') : '否'}`
-  ].join('\n');
+    `全局并发：${activeRuns.size}/${MAX_CONCURRENCY}`,
+    `总排队任务：${totalQueuedTasks()}`,
+    `活跃会话：${activeRuns.size}`
+  ];
+  if (activeRuns.size > 0) {
+    lines.push('正在执行：');
+    for (const run of activeRuns.values()) {
+      const backendLabel = BACKEND_LABELS[run.backend] || run.backend;
+      const taskKind = run.task && run.task.kind === 'approval' ? '审批任务' : '普通任务';
+      lines.push(`  · ${run.session.scopeKey} [${backendLabel}] ${taskKind}`);
+    }
+  }
+  if (sessionQueues.size > 0) {
+    lines.push('等待队列：');
+    for (const [sessionKey, queue] of sessionQueues.entries()) {
+      if (queue.length === 0) continue;
+      const sample = queue[0];
+      const backendLabel = BACKEND_LABELS[sample && sample.backend] || (sample && sample.backend) || 'codex';
+      lines.push(`  · ${sessionKey.split('::')[0]} [${backendLabel}] × ${queue.length}`);
+    }
+  }
+  return lines.join('\n');
 }
 
 function getSessionMessage(context) {
@@ -2930,16 +3000,22 @@ function getSessionMessage(context) {
   const currentSession = getSessionForContext(context, runnerState.workdir, backend);
   const tokenUsage = ensureSessionTokenUsage(currentSession);
   const threadLabel = backend === 'claude' ? 'Session ID' : '线程 ID';
+  const callerSessionKey = sessionIdentityForContext(context, backend);
+  const callerQueueDepth = queueDepthForSession(callerSessionKey);
+  const callerRunActive = activeRuns.has(callerSessionKey);
+  const callerPendingEntry = findPendingApprovalByScope(scopeKey);
+  const callerPending = callerPendingEntry ? callerPendingEntry.approval : null;
   const lines = [
     '会话状态：',
     `当前会话键：${currentSession.scopeKey}`,
     `当前后端：${BACKEND_LABELS[backend]}`,
     `当前目录会话已建立：${currentSession.hasConversation ? '是' : '否'}`,
-    `后端忙碌中：${codexProcess.busy ? '是' : '否'}`,
+    `该会话是否在跑：${callerRunActive ? '是' : '否'}`,
+    `该会话队列：${callerQueueDepth}`,
     `当前目录会话代次：${currentSession.generation}`,
     `当前目录${threadLabel}：${currentSession.threadId || '无'}`,
     `已缓存目录会话：${countActiveSessions()}`,
-    `存在待审批：${pendingApproval ? '是' : '否'}`,
+    `存在待审批（当前聊天）：${callerPending ? '是' : '否'}`,
     `工作目录：${runnerState.workdir}`,
     `权限模式：${VALID_ACCESS_MODES.get(runnerState.accessMode).label}`
   ];
@@ -2961,8 +3037,8 @@ function getSessionMessage(context) {
   }
 
   lines.push(`最近一轮 Token：${formatTokenUsage(tokenUsage.lastUsage)}`);
-  if (pendingApproval) {
-    lines.push(`待审批命令：${pendingApproval.command}`);
+  if (callerPending) {
+    lines.push(`待审批命令：${callerPending.command}`);
   }
   return lines.join('\n');
 }
@@ -3176,7 +3252,7 @@ function buildCodexArgs(prompt, outputFile, session, workdir) {
   return args;
 }
 
-function runCodexExec(prompt, session, workdir, context) {
+function runCodexExec(prompt, session, workdir, context, run) {
   return new Promise((resolve, reject) => {
     const generation = session.generation;
     const outputFile = path.join(os.tmpdir(), `qq-codex-runner-last-${process.pid}-${Date.now()}.txt`);
@@ -3192,9 +3268,7 @@ function runCodexExec(prompt, session, workdir, context) {
       stdio: ['ignore', 'pipe', 'pipe']
     });
 
-    codexProcess.child = child;
-    codexProcess.busy = true;
-    codexProcess.session = session;
+    if (run) run.child = child;
 
     let stdout = '';
     let stdoutBuffer = '';
@@ -3217,9 +3291,7 @@ function runCodexExec(prompt, session, workdir, context) {
         try {
           child.kill('SIGTERM');
         } catch (_) {}
-        codexProcess.child = null;
-        codexProcess.busy = false;
-        codexProcess.session = null;
+        if (run) run.child = null;
         if (generation !== session.generation) {
           void progressReporter.stop().then(() => {
             resolve(null);
@@ -3267,9 +3339,7 @@ function runCodexExec(prompt, session, workdir, context) {
       if (settled) return;
       settled = true;
       clearExecTimeout();
-      codexProcess.child = null;
-      codexProcess.busy = false;
-      codexProcess.session = null;
+      if (run) run.child = null;
       void (async () => {
         await progressReporter.stop();
         if (generation !== session.generation) {
@@ -3284,9 +3354,7 @@ function runCodexExec(prompt, session, workdir, context) {
       if (settled) return;
       settled = true;
       clearExecTimeout();
-      codexProcess.child = null;
-      codexProcess.busy = false;
-      codexProcess.session = null;
+      if (run) run.child = null;
       void (async () => {
         handleStdoutEvent(parseExecJsonEventLine(stdoutBuffer));
         await progressReporter.stop();
@@ -3370,7 +3438,7 @@ function summarizeClaudeFailure(stderr, stdout, events) {
   return combined.split('\n').slice(-12).join('\n');
 }
 
-function runClaudeExec(prompt, session, workdir, context) {
+function runClaudeExec(prompt, session, workdir, context, run) {
   return new Promise((resolve, reject) => {
     const generation = session.generation;
     const args = buildClaudeArgs(prompt, session, workdir);
@@ -3404,9 +3472,7 @@ function runClaudeExec(prompt, session, workdir, context) {
       return;
     }
 
-    codexProcess.child = child;
-    codexProcess.busy = true;
-    codexProcess.session = session;
+    if (run) run.child = child;
 
     let stdout = '';
     let stdoutBuffer = '';
@@ -3427,9 +3493,7 @@ function runClaudeExec(prompt, session, workdir, context) {
         if (settled) return;
         settled = true;
         try { child.kill('SIGTERM'); } catch (_) {}
-        codexProcess.child = null;
-        codexProcess.busy = false;
-        codexProcess.session = null;
+        if (run) run.child = null;
         if (generation !== session.generation) {
           void progressReporter.stop().then(() => resolve(null));
           return;
@@ -3475,9 +3539,7 @@ function runClaudeExec(prompt, session, workdir, context) {
       if (settled) return;
       settled = true;
       clearExecTimeout();
-      codexProcess.child = null;
-      codexProcess.busy = false;
-      codexProcess.session = null;
+      if (run) run.child = null;
       void (async () => {
         await progressReporter.stop();
         if (generation !== session.generation) {
@@ -3498,9 +3560,7 @@ function runClaudeExec(prompt, session, workdir, context) {
       if (settled) return;
       settled = true;
       clearExecTimeout();
-      codexProcess.child = null;
-      codexProcess.busy = false;
-      codexProcess.session = null;
+      if (run) run.child = null;
       void (async () => {
         handleStdoutEvent(parseExecJsonEventLine(stdoutBuffer));
         await progressReporter.stop();
@@ -3562,24 +3622,27 @@ function runClaudeExec(prompt, session, workdir, context) {
 }
 
 async function resetCodexSession(context) {
-  resetSessionState(getSessionForContext(context));
-  pendingApproval = null;
+  const session = getSessionForContext(context);
+  const sessionKey = buildSessionIdentity(session.scopeKey, session.workdir, session.backend);
+  resetSessionState(session);
+  pendingApprovals.delete(sessionKey);
+  clearQueueForSession(sessionKey);
+  stopActiveRun(sessionKey);
   clearRecentWorkdirSearch();
-  stopActiveCodexProcess();
   persistRunnerState();
 
   await safeSendReply(context, '当前会话已重置，下一条消息会启动新的对话。');
 }
 
 async function restartRunner(context) {
-  stopActiveCodexProcess();
-  pendingApproval = null;
-  taskQueue.length = 0;
+  stopAllActiveRuns();
+  pendingApprovals.clear();
+  clearAllQueues();
   clearRecentWorkdirSearch();
   codexSessions.clear();
   persistRunnerState();
 
-  await safeSendReply(context, 'Runner 状态已重启：队列已清空，所有目录会话已重置。');
+  await safeSendReply(context, 'Runner 状态已重启：已停止所有任务、清空所有队列并重置全部会话。');
 }
 
 async function switchWorkdir(context, rawDir, options = {}) {
@@ -3593,17 +3656,16 @@ async function switchWorkdir(context, rawDir, options = {}) {
     return;
   }
 
-  stopActiveCodexProcess();
-  pendingApproval = null;
-  taskQueue.length = 0;
   clearRecentWorkdirSearch();
-
   runnerState.workdir = resolved;
   const targetSession = getSessionForContext(context, resolved);
   persistRunnerState();
-  const switchHint = fromSearchSelection ? '已根据搜索结果切换工作目录。' : '已切换工作目录。';
+
+  const switchHint = fromSearchSelection
+    ? '已根据搜索结果切换工作目录（热切，已在跑的任务按原目录跑完）。'
+    : '已切换工作目录（热切，已在跑的任务按原目录跑完）。';
   const sessionHint = targetSession.hasConversation
-    ? '已恢复该目录之前的 Codex 会话。'
+    ? '已恢复该目录之前的会话。'
     : '这是该目录的首次会话，下一条消息会新开对话。';
   await safeSendReply(context, `${switchHint}\n当前目录：${resolved}\n${sessionHint}`);
 }
@@ -3711,42 +3773,50 @@ async function switchAccessMode(context, rawMode) {
     return;
   }
 
+  if (runnerState.accessMode === mode) {
+    await safeSendReply(
+      context,
+      `当前已是该权限模式：${VALID_ACCESS_MODES.get(mode).label}`
+    );
+    return;
+  }
+
   runnerState.accessMode = mode;
-  stopActiveCodexProcess();
-  pendingApproval = null;
-  taskQueue.length = 0;
-  clearRecentWorkdirSearch();
   persistRunnerState();
 
   await safeSendReply(
     context,
-    `权限模式已切换为：${VALID_ACCESS_MODES.get(mode).label}\n已清空等待队列并终止正在运行的任务，现有会话保留，下一条消息会以新权限继续。`
+    `权限模式已热切换为：${VALID_ACCESS_MODES.get(mode).label}\n已在跑的任务保持旧权限跑完；队列中未开始的任务以及下一条消息会以新权限启动。`
   );
 }
 
-async function executeTask(task) {
-  runnerState.workdir = task.workdir;
-  const backend = task.backend && VALID_BACKENDS.has(task.backend)
-    ? task.backend
-    : getActiveBackend(task.sessionScopeKey);
-  const session = getScopedSession(task.sessionScopeKey, task.workdir, backend);
+async function executeTask(task, run) {
+  const backend = run && run.backend
+    ? run.backend
+    : (task.backend && VALID_BACKENDS.has(task.backend)
+      ? task.backend
+      : getActiveBackend(task.sessionScopeKey));
+  const session = (run && run.session)
+    || getScopedSession(task.sessionScopeKey, task.workdir, backend);
+  const sessionKey = sessionIdentityForTask({ ...task, backend });
+  const pendingApprovalForSession = pendingApprovals.get(sessionKey) || null;
 
-  if (codexProcess.busy) {
-    await safeSendReply(task.context, `${BACKEND_LABELS[backend]} 正在处理上一条消息，请稍候。`);
-    return;
-  }
-
-  await safeSendReply(task.context, `开始执行（${BACKEND_LABELS[backend]}），队列剩余 ${taskQueue.length} 条。`);
+  const queueDepth = queueDepthForSession(sessionKey);
+  const queueHint = queueDepth > 0 ? `，该会话队列剩余 ${queueDepth} 条` : '';
+  await safeSendReply(
+    task.context,
+    `开始执行（${BACKEND_LABELS[backend]}，并发槽 ${activeRuns.size}/${MAX_CONCURRENCY}${queueHint}）。`
+  );
 
   try {
     const includePolicy = !(session.hasConversation && session.threadId);
     const prompt = task.kind === 'approval'
-      ? buildApprovalPrompt(task.action, pendingApproval, { includePolicy })
+      ? buildApprovalPrompt(task.action, pendingApprovalForSession, { includePolicy })
       : buildUserPrompt(task.input, { includePolicy, backend });
 
     const reply = backend === 'claude'
-      ? await runClaudeExec(prompt, session, task.workdir, task.context)
-      : await runCodexExec(prompt, session, task.workdir, task.context);
+      ? await runClaudeExec(prompt, session, task.workdir, task.context, run)
+      : await runCodexExec(prompt, session, task.workdir, task.context, run);
     if (!reply) {
       return;
     }
@@ -3754,14 +3824,14 @@ async function executeTask(task) {
     const approval = backend === 'codex' ? parseApprovalRequest(reply) : null;
 
     if (approval) {
-      pendingApproval = {
+      pendingApprovals.set(sessionKey, {
         command: approval.command,
         reason: approval.reason,
         context: task.context,
         workdir: task.workdir,
         sessionScopeKey: task.sessionScopeKey,
         backend
-      };
+      });
       const approvalMessage = [
         '检测到需要审批的操作：',
         approval.command,
@@ -3772,28 +3842,45 @@ async function executeTask(task) {
       return;
     }
 
-    pendingApproval = null;
+    pendingApprovals.delete(sessionKey);
     await safeSendReply(task.context, reply);
   } catch (error) {
     await safeSendReply(task.context, error && error.message ? error.message : String(error));
   }
 }
 
-async function processQueue() {
-  if (activeTask || taskQueue.length === 0) return;
-  if (pendingApproval && taskQueue[0] && taskQueue[0].kind !== 'approval') return;
+function tickQueues() {
+  if (sessionQueues.size === 0) return;
+  const keys = Array.from(sessionQueues.keys());
+  for (const sessionKey of keys) {
+    if (activeRuns.size >= MAX_CONCURRENCY) break;
+    if (activeRuns.has(sessionKey)) continue;
+    const queue = sessionQueues.get(sessionKey);
+    if (!queue || queue.length === 0) continue;
+    const head = queue[0];
+    if (pendingApprovals.has(sessionKey) && head.kind !== 'approval') continue;
+    queue.shift();
+    if (queue.length === 0) sessionQueues.delete(sessionKey);
+    void runTask(sessionKey, head);
+  }
+}
 
-  const task = taskQueue.shift();
-  if (!task) return;
-
-  activeTask = task;
+async function runTask(sessionKey, task) {
+  const backend = task.backend || getActiveBackend(task.sessionScopeKey);
+  const session = getScopedSession(task.sessionScopeKey, task.workdir, backend);
+  const run = {
+    task,
+    session,
+    child: null,
+    generation: session.generation,
+    backend
+  };
+  activeRuns.set(sessionKey, run);
   try {
-    await executeTask(task);
+    await executeTask(task, run);
   } finally {
-    activeTask = null;
-    if (!codexProcess.busy && taskQueue.length > 0) {
-      void processQueue();
-    }
+    activeRuns.delete(sessionKey);
+    tickQueues();
   }
 }
 
@@ -3869,8 +3956,12 @@ async function enqueueMessage(eventType, message, source = {}) {
     return;
   }
 
+  const scopeKey = context.sessionScopeKey;
+  const scopedApprovalEntry = findPendingApprovalByScope(scopeKey);
+  const scopedApproval = scopedApprovalEntry ? scopedApprovalEntry.approval : null;
+
   if (input === '/reject') {
-    if (!pendingApproval) {
+    if (!scopedApproval) {
       await safeSendReply(context, '当前没有待审批的操作。');
       return;
     }
@@ -3879,7 +3970,7 @@ async function enqueueMessage(eventType, message, source = {}) {
   }
 
   if (input === '/allow' || input === '/skip') {
-    if (!pendingApproval) {
+    if (!scopedApproval) {
       await safeSendReply(context, '当前没有待审批的操作。');
       return;
     }
@@ -3889,21 +3980,17 @@ async function enqueueMessage(eventType, message, source = {}) {
       action: input === '/allow' ? 'allow' : 'skip',
       input,
       context,
-      workdir: pendingApproval.workdir,
-      sessionScopeKey: pendingApproval.sessionScopeKey,
-      backend: pendingApproval.backend || 'codex'
+      workdir: scopedApproval.workdir,
+      sessionScopeKey: scopedApproval.sessionScopeKey,
+      backend: scopedApproval.backend || 'codex'
     };
-
-    const queuedAhead = activeTask ? 1 : 0;
-    taskQueue.unshift(approvalTask);
-    if (queuedAhead > 0) {
-      await safeSendReply(context, `已加入队列，前面还有 ${queuedAhead} 个任务。`);
-    }
-    void processQueue();
+    const approvalSessionKey = sessionIdentityForTask(approvalTask);
+    enqueueToSessionQueue(approvalSessionKey, approvalTask, { priority: true });
+    tickQueues();
     return;
   }
 
-  if (pendingApproval) {
+  if (scopedApproval) {
     await safeSendReply(context, '当前有待审批操作，请先回复 /allow、/skip 或 /reject。');
     return;
   }
@@ -3927,13 +4014,17 @@ async function enqueueMessage(eventType, message, source = {}) {
     sessionScopeKey: context.sessionScopeKey,
     backend: getActiveBackend(context.sessionScopeKey)
   };
-
-  const queuedAhead = (activeTask ? 1 : 0) + taskQueue.length;
-  taskQueue.push(task);
+  const taskSessionKey = sessionIdentityForTask(task);
+  const depthBefore = queueDepthForSession(taskSessionKey);
+  const isSessionRunning = activeRuns.has(taskSessionKey);
+  const queuedAhead = depthBefore + (isSessionRunning ? 1 : 0);
+  enqueueToSessionQueue(taskSessionKey, task);
   if (queuedAhead > 0) {
-    await safeSendReply(context, `已加入队列，前面还有 ${queuedAhead} 个任务。`);
+    await safeSendReply(context, `已加入该会话队列，前面还有 ${queuedAhead} 个任务。`);
+  } else if (activeRuns.size >= MAX_CONCURRENCY) {
+    await safeSendReply(context, `已加入队列，全局并发 ${activeRuns.size}/${MAX_CONCURRENCY} 已满，待空闲槽释放后执行。`);
   }
-  void processQueue();
+  tickQueues();
 }
 
 async function startRunner() {
@@ -3952,11 +4043,7 @@ async function startRunner() {
 
   for (const signalName of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     process.on(signalName, async () => {
-      if (codexProcess && codexProcess.child) {
-        try {
-          codexProcess.child.kill(signalName);
-        } catch (_) {}
-      }
+      stopAllActiveRuns(signalName);
       stopRunnerStateWatcher();
       const closes = [];
       for (const bot of weixinBots.values()) {
