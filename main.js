@@ -46,7 +46,7 @@ function usage(exitCode = 1) {
   const message = [
     'Usage:',
     '  qq-codex-runner [--cmd <codex-bin>] -- <codex args...>',
-    '  qq-codex-runner --weixin-login [--weixin-account <id>] [--weixin-login-force]',
+    '  qq-codex-runner --weixin-login [--weixin-account <id>] [--weixin-name <alias>] [--weixin-login-force]',
     '  qq-codex-runner --weixin-logout [--weixin-account <id>]',
     '  qq-codex-runner --help'
   ].join('\n');
@@ -440,6 +440,8 @@ function intentsToBitmask(intents) {
 
 class QQBotClient {
   constructor(config) {
+    this.id = sanitizeText(config.id) || sanitizeText(config.appId);
+    this.name = sanitizeText(config.name) || this.id;
     this.appId = config.appId;
     this.secret = config.secret;
     this.apiBase = config.apiBase;
@@ -678,6 +680,7 @@ class QQBotClient {
 class WeixinClient {
   constructor(config) {
     this.accountId = config.accountId || 'default';
+    this.name = sanitizeText(config.name) || defaultWeixinDisplayName(this.accountId);
     this.baseUrl = String(config.baseUrl || '').replace(/\/+$/, '');
     this.token = config.token || '';
     this.longPollTimeoutMs = Number(config.longPollTimeoutMs || 35_000);
@@ -907,6 +910,7 @@ function parseArgs(argv) {
   let mode = 'runner';
   let weixinAccountId = sanitizeText(process.env.WEIXIN_ACCOUNT_ID || 'default') || 'default';
   let weixinLoginForce = false;
+  let weixinName = '';
 
   for (let index = 0; index < runnerArgs.length; index += 1) {
     const token = runnerArgs[index];
@@ -930,6 +934,13 @@ function parseArgs(argv) {
       index += 1;
       continue;
     }
+    if (token === '--weixin-name') {
+      const next = runnerArgs[index + 1];
+      if (!next) usage(1);
+      weixinName = sanitizeText(next);
+      index += 1;
+      continue;
+    }
     if (token === '--cmd') {
       const next = runnerArgs[index + 1];
       if (!next) usage(1);
@@ -940,7 +951,7 @@ function parseArgs(argv) {
     usage(1);
   }
 
-  return { command, codexArgs, mode, weixinAccountId, weixinLoginForce };
+  return { command, codexArgs, mode, weixinAccountId, weixinLoginForce, weixinName };
 }
 
 function parseExecJsonEvents(output) {
@@ -1529,18 +1540,131 @@ function describeBackendRuntimeError(backend, stderr, stdout) {
   return '\n提示：疑似 Codex 认证问题。请运行 `codex login`，或检查 OPENAI_API_KEY / CODEX_HOME 是否有效。';
 }
 
-function createQQBotClient() {
-  return new QQBotClient({
-    appId: requireEnv('QQ_BOT_APP_ID'),
-    secret: process.env.QQ_BOT_SECRET || process.env.QQ_BOT_CLIENT_SECRET || requireEnv('QQ_BOT_SECRET'),
+function defaultQQApiBase(sandbox) {
+  return parseBoolean(sandbox, false)
+    ? 'https://sandbox.api.sgroup.qq.com'
+    : 'https://api.sgroup.qq.com';
+}
+
+function normalizeQQBotEntry(entry, index, seenIds) {
+  const appId = sanitizeText(entry && (entry.appId || entry.app_id));
+  const secret = sanitizeText(
+    (entry && (entry.secret || entry.clientSecret || entry.client_secret)) || ''
+  );
+  if (!appId || !secret) {
+    process.stderr.write(`QQ_BOTS[${index}] is missing appId or secret\n`);
+    process.exit(1);
+  }
+  const id = sanitizeText(entry && entry.id) || appId;
+  if (seenIds.has(id)) {
+    process.stderr.write(`QQ_BOTS contains duplicate bot id: ${id}\n`);
+    process.exit(1);
+  }
+  seenIds.add(id);
+
+  const entrySandbox = entry && entry.sandbox !== undefined ? String(entry.sandbox) : '';
+  const intents = parseIntents(
+    sanitizeText(entry && entry.intents) || process.env.QQ_BOT_INTENTS
+  );
+  const apiBase =
+    sanitizeText(entry && (entry.apiBase || entry.api_base)) ||
+    process.env.QQ_BOT_API_BASE ||
+    defaultQQApiBase(entrySandbox || process.env.QQ_BOT_SANDBOX);
+  const tokenBase =
+    sanitizeText(entry && (entry.tokenBase || entry.token_base)) ||
+    process.env.QQ_BOT_TOKEN_BASE ||
+    'https://bots.qq.com';
+  const name = sanitizeText(entry && entry.name) || id;
+
+  return { id, name, appId, secret, intents, apiBase, tokenBase };
+}
+
+function loadQQBotConfigs() {
+  const raw = sanitizeText(process.env.QQ_BOTS);
+  if (raw) {
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      process.stderr.write(`Invalid QQ_BOTS JSON: ${error && error.message ? error.message : error}\n`);
+      process.exit(1);
+    }
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      process.stderr.write('QQ_BOTS must be a non-empty JSON array.\n');
+      process.exit(1);
+    }
+    const seenIds = new Set();
+    return parsed.map((entry, index) => normalizeQQBotEntry(entry, index, seenIds));
+  }
+
+  const appId = requireEnv('QQ_BOT_APP_ID');
+  const secret =
+    process.env.QQ_BOT_SECRET ||
+    process.env.QQ_BOT_CLIENT_SECRET ||
+    requireEnv('QQ_BOT_SECRET');
+
+  return [{
+    id: appId,
+    name: sanitizeText(process.env.QQ_BOT_NAME) || 'qq机器人',
+    appId,
+    secret,
     intents: parseIntents(process.env.QQ_BOT_INTENTS),
     apiBase:
-      process.env.QQ_BOT_API_BASE ||
-      (parseBoolean(process.env.QQ_BOT_SANDBOX, false)
-        ? 'https://sandbox.api.sgroup.qq.com'
-        : 'https://api.sgroup.qq.com'),
+      process.env.QQ_BOT_API_BASE || defaultQQApiBase(process.env.QQ_BOT_SANDBOX),
     tokenBase: process.env.QQ_BOT_TOKEN_BASE || 'https://bots.qq.com'
+  }];
+}
+
+function createQQBotClientFromConfig(config) {
+  return new QQBotClient({
+    id: config.id,
+    name: config.name,
+    appId: config.appId,
+    secret: config.secret,
+    intents: config.intents,
+    apiBase: config.apiBase,
+    tokenBase: config.tokenBase
   });
+}
+
+function parseWeixinAccountWhitelist() {
+  const raw = sanitizeText(process.env.WEIXIN_ACCOUNTS);
+  if (!raw) return null;
+  const list = raw
+    .split(',')
+    .map((item) => sanitizeText(item))
+    .filter(Boolean);
+  return list.length > 0 ? new Set(list) : null;
+}
+
+function parseWeixinAccountNames() {
+  const raw = sanitizeText(process.env.WEIXIN_NAMES);
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      log('Ignoring WEIXIN_NAMES: expected a JSON object like {"default":"微信机器人"}');
+      return {};
+    }
+    const result = {};
+    for (const [accountId, name] of Object.entries(parsed)) {
+      const normalizedId = sanitizeText(accountId);
+      const normalizedName = sanitizeText(name);
+      if (normalizedId && normalizedName) {
+        result[normalizedId] = normalizedName;
+      }
+    }
+    return result;
+  } catch (error) {
+    log(`Ignoring invalid WEIXIN_NAMES JSON: ${error && error.message ? error.message : error}`);
+    return {};
+  }
+}
+
+function defaultWeixinDisplayName(accountId) {
+  const normalized = sanitizeText(accountId);
+  if (!normalized || normalized === 'default') return '微信机器人';
+  return normalized;
 }
 
 const WEIXIN_LOGIN_BASE_URL = 'https://ilinkai.weixin.qq.com';
@@ -1574,11 +1698,16 @@ async function pollWeixinQrStatus(qrcode, apiBaseUrl = WEIXIN_LOGIN_BASE_URL) {
   }
 }
 
-async function runWeixinLoginFlow(accountId, force = false) {
+async function runWeixinLoginFlow(accountId, force = false, name = '') {
   const normalizedAccountId = sanitizeText(accountId) || 'default';
+  const normalizedName = sanitizeText(name);
   if (!force) {
     const existing = getStoredWeixinAccount(normalizedAccountId);
     if (existing && sanitizeText(existing.token)) {
+      if (normalizedName && sanitizeText(existing.name) !== normalizedName) {
+        setStoredWeixinAccount({ ...existing, name: normalizedName });
+        process.stdout.write(`Weixin account alias updated: ${normalizedAccountId} -> ${normalizedName}\n`);
+      }
       process.stdout.write(`Weixin account already configured: ${normalizedAccountId}\n`);
       process.stdout.write(`Base URL: ${existing.baseUrl || WEIXIN_LOGIN_BASE_URL}\n`);
       return 0;
@@ -1629,13 +1758,15 @@ async function runWeixinLoginFlow(accountId, force = false) {
 
       setStoredWeixinAccount({
         accountId: ilinkBotId,
+        name: normalizedName,
         token: botToken,
         baseUrl,
         userId
       });
 
+      const displayName = normalizedName || defaultWeixinDisplayName(ilinkBotId);
       process.stdout.write(
-        `Weixin login succeeded.\nAccount ID: ${ilinkBotId}\nBase URL: ${baseUrl}\n` +
+        `Weixin login succeeded.\nAccount ID: ${ilinkBotId}\nAlias: ${displayName}\nBase URL: ${baseUrl}\n` +
         'If the runner service is already running, it will pick up this login automatically within about 1 second.\n'
       );
       return 0;
@@ -1683,8 +1814,8 @@ function buildApprovalPrompt(action, pendingApproval, options = {}) {
 
 loadDotEnv();
 
-const { command, codexArgs, mode, weixinAccountId, weixinLoginForce } = parseArgs(process.argv.slice(2));
-let qqBot = null;
+const { command, codexArgs, mode, weixinAccountId, weixinLoginForce, weixinName } = parseArgs(process.argv.slice(2));
+const qqBots = new Map();
 const WEIXIN_ENABLED = parseBoolean(process.env.WEIXIN_ENABLED, true);
 
 const MAX_BOT_MESSAGE_LENGTH = 1500;
@@ -1769,7 +1900,7 @@ let recentWorkdirSearch = {
   matches: []
 };
 let weixinState = deriveInitialWeixinState(persistedRunnerState);
-let weixinBot = null;
+const weixinBots = new Map();
 let runnerStateWatcher = null;
 
 function buildChatTurnPrompt(input, options = {}) {
@@ -1994,6 +2125,7 @@ function deriveInitialWeixinState(persistedState) {
       if (!normalizedAccountId || !value || typeof value !== 'object') continue;
       state.accounts[normalizedAccountId] = {
         accountId: normalizedAccountId,
+        name: sanitizeText(value.name),
         token: sanitizeText(value.token),
         baseUrl: sanitizeText(value.baseUrl),
         userId: sanitizeText(value.userId)
@@ -2020,8 +2152,10 @@ function getStoredWeixinAccount(accountId) {
 
 function setStoredWeixinAccount(account) {
   const normalizedAccountId = sanitizeText(account && account.accountId) || 'default';
+  const previous = weixinState.accounts[normalizedAccountId] || {};
   weixinState.accounts[normalizedAccountId] = {
     accountId: normalizedAccountId,
+    name: sanitizeText(account && account.name) || sanitizeText(previous.name),
     token: sanitizeText(account && account.token),
     baseUrl: sanitizeText(account && account.baseUrl),
     userId: sanitizeText(account && account.userId)
@@ -2044,8 +2178,9 @@ function clearStoredWeixinAccount(accountId) {
       codexSessions.delete(sessionKey);
     }
   }
-  if (weixinBot && weixinBot.accountId === normalizedAccountId) {
-    weixinBot.ready = false;
+  const existingBot = weixinBots.get(normalizedAccountId);
+  if (existingBot) {
+    existingBot.ready = false;
   }
   if (weixinState.defaultAccountId === normalizedAccountId) {
     const remainingAccountId = Object.keys(weixinState.accounts)[0];
@@ -2058,8 +2193,15 @@ function resolveWeixinRuntimeAccount(accountId) {
   const requestedAccountId = sanitizeText(accountId) || '';
   const normalizedAccountId = requestedAccountId || weixinState.defaultAccountId || 'default';
   const stored = getStoredWeixinAccount(normalizedAccountId) || getStoredWeixinAccount(weixinState.defaultAccountId);
+  const resolvedAccountId = sanitizeText(stored && stored.accountId) || normalizedAccountId;
+  const nameOverrides = parseWeixinAccountNames();
+  const name =
+    sanitizeText(nameOverrides[resolvedAccountId]) ||
+    sanitizeText(stored && stored.name) ||
+    defaultWeixinDisplayName(resolvedAccountId);
   return {
-    accountId: sanitizeText(stored && stored.accountId) || normalizedAccountId,
+    accountId: resolvedAccountId,
+    name,
     token: sanitizeText(process.env.WEIXIN_TOKEN) || sanitizeText(stored && stored.token),
     baseUrl:
       sanitizeText(process.env.WEIXIN_BASE_URL) ||
@@ -2075,57 +2217,143 @@ function syncWeixinStateFromDisk() {
   weixinState = deriveInitialWeixinState(latestState);
 }
 
-function getDesiredWeixinAccount() {
-  const account = resolveWeixinRuntimeAccount(WEIXIN_ACCOUNT_ID);
-  const hasCredentials = Boolean(sanitizeText(account.token));
-  return {
-    ...account,
-    enabled: WEIXIN_ENABLED && hasCredentials
-  };
+function migrateLegacyQQSessions(qqConfigs) {
+  if (!Array.isArray(qqConfigs) || qqConfigs.length === 0) return;
+
+  const legacyPattern = /^qq:(channel|c2c):(.*)$/;
+
+  const legacySessions = [];
+  for (const [key, session] of codexSessions.entries()) {
+    if (!session || !session.scopeKey) continue;
+    const match = session.scopeKey.match(legacyPattern);
+    if (!match) continue;
+    legacySessions.push({ key, session, kind: match[1], tail: match[2] });
+  }
+
+  const backendKeys = runnerState.backends && typeof runnerState.backends === 'object'
+    ? Object.keys(runnerState.backends)
+    : [];
+  const legacyBackendKeys = backendKeys.filter((k) => legacyPattern.test(k));
+
+  if (legacySessions.length === 0 && legacyBackendKeys.length === 0) return;
+
+  if (qqConfigs.length > 1) {
+    if (legacySessions.length > 0) {
+      log(
+        `Dropping ${legacySessions.length} legacy QQ session(s) (pre-multi-bot format): ` +
+        'multiple QQ_BOTS configured, cannot auto-assign. Use /restart or reconfigure with a single bot to migrate.'
+      );
+      for (const { key } of legacySessions) {
+        codexSessions.delete(key);
+      }
+    }
+    for (const oldKey of legacyBackendKeys) {
+      delete runnerState.backends[oldKey];
+    }
+    persistRunnerState();
+    return;
+  }
+
+  const botId = qqConfigs[0].id;
+
+  for (const { key, session, kind, tail } of legacySessions) {
+    const newScopeKey = `qq:${botId}:${kind}:${tail}`;
+    const newKey = buildSessionIdentity(newScopeKey, session.workdir, session.backend);
+    codexSessions.delete(key);
+    session.scopeKey = newScopeKey;
+    codexSessions.set(newKey, session);
+  }
+
+  for (const oldKey of legacyBackendKeys) {
+    const match = oldKey.match(legacyPattern);
+    if (!match) continue;
+    const newKey = `qq:${botId}:${match[1]}:${match[2]}`;
+    runnerState.backends[newKey] = runnerState.backends[oldKey];
+    delete runnerState.backends[oldKey];
+  }
+
+  if (legacySessions.length > 0 || legacyBackendKeys.length > 0) {
+    log(
+      `Migrated ${legacySessions.length} legacy QQ session(s) and ${legacyBackendKeys.length} backend selection(s) to bot id: ${botId}`
+    );
+    persistRunnerState();
+  }
 }
 
-async function refreshWeixinClient() {
+function getDesiredWeixinAccounts() {
+  if (!WEIXIN_ENABLED) return new Map();
+
+  const whitelist = parseWeixinAccountWhitelist();
+  const desired = new Map();
+  const accountIds = Object.keys(weixinState.accounts || {});
+
+  for (const accountId of accountIds) {
+    if (whitelist && !whitelist.has(accountId)) continue;
+    const runtime = resolveWeixinRuntimeAccount(accountId);
+    if (!sanitizeText(runtime.token)) continue;
+    desired.set(runtime.accountId, runtime);
+  }
+
+  return desired;
+}
+
+async function refreshWeixinClients() {
   syncWeixinStateFromDisk();
-  const desiredAccount = getDesiredWeixinAccount();
+  const desired = getDesiredWeixinAccounts();
 
-  if (!desiredAccount.enabled) {
-    if (weixinBot) {
-      const closingBot = weixinBot;
-      weixinBot = null;
-      log(`Stopping Weixin client for account ${closingBot.accountId}.`);
-      await closingBot.close();
+  const toClose = [];
+  for (const [accountId, bot] of weixinBots.entries()) {
+    const runtime = desired.get(accountId);
+    if (!runtime) {
+      weixinBots.delete(accountId);
+      toClose.push(bot);
+      continue;
     }
-    return;
+    if (
+      sanitizeText(bot.baseUrl) !== sanitizeText(runtime.baseUrl) ||
+      sanitizeText(bot.token) !== sanitizeText(runtime.token)
+    ) {
+      weixinBots.delete(accountId);
+      toClose.push(bot);
+    }
   }
 
-  if (
-    weixinBot &&
-    weixinBot.accountId === desiredAccount.accountId &&
-    sanitizeText(weixinBot.baseUrl) === sanitizeText(desiredAccount.baseUrl) &&
-    sanitizeText(weixinBot.token) === sanitizeText(desiredAccount.token)
-  ) {
-    return;
-  }
+  await Promise.all(
+    toClose.map((bot) => {
+      log(`Stopping Weixin client for account ${bot.accountId}.`);
+      return Promise.resolve(bot.close()).catch(() => {});
+    })
+  );
 
-  if (weixinBot) {
-    const closingBot = weixinBot;
-    weixinBot = null;
-    log(`Reloading Weixin client for account ${closingBot.accountId}.`);
-    await closingBot.close();
+  for (const [accountId, runtime] of desired.entries()) {
+    const existing = weixinBots.get(accountId);
+    if (existing) {
+      const nextName = sanitizeText(runtime.name) || existing.name;
+      if (nextName && nextName !== existing.name) {
+        existing.name = nextName;
+      }
+      continue;
+    }
+    const client = new WeixinClient({
+      accountId: runtime.accountId,
+      name: runtime.name,
+      baseUrl: runtime.baseUrl,
+      token: runtime.token,
+      longPollTimeoutMs: Number(process.env.WEIXIN_LONG_POLL_TIMEOUT_MS || 35_000)
+    });
+    client.onMessage((eventType, message) => {
+      void enqueueMessage(eventType, message, { accountId: client.accountId });
+    });
+    weixinBots.set(accountId, client);
+    log(`Starting Weixin client for account ${client.accountId}.`);
+    client.connect().catch((error) => {
+      log(
+        `Failed to start Weixin client ${client.accountId}: ${
+          error && error.message ? error.message : String(error)
+        }`
+      );
+    });
   }
-
-  const nextBot = new WeixinClient({
-    accountId: desiredAccount.accountId,
-    baseUrl: desiredAccount.baseUrl,
-    token: desiredAccount.token,
-    longPollTimeoutMs: Number(process.env.WEIXIN_LONG_POLL_TIMEOUT_MS || 35_000)
-  });
-  nextBot.onMessage(enqueueMessage);
-  weixinBot = nextBot;
-  log(`Starting Weixin client for account ${nextBot.accountId}.`);
-  nextBot.connect().catch((error) => {
-    log(`Failed to start Weixin client: ${error && error.message ? error.message : String(error)}`);
-  });
 }
 
 function startRunnerStateWatcher() {
@@ -2134,7 +2362,7 @@ function startRunnerStateWatcher() {
     RUNNER_STATE_FILE,
     { interval: 1000 },
     () => {
-      void refreshWeixinClient();
+      void refreshWeixinClients();
     }
   );
 }
@@ -2201,10 +2429,11 @@ function getContextSessionScopeKey(context) {
   if (context.platform === 'weixin') {
     return `weixin:${sanitizeText(context.accountId) || 'default'}:direct:${sanitizeText(context.peerId) || 'unknown'}`;
   }
+  const botId = sanitizeText(context.botId) || 'default';
   if (context.type === 'c2c') {
-    return `qq:c2c:${sanitizeText(context.openid) || 'unknown'}`;
+    return `qq:${botId}:c2c:${sanitizeText(context.openid) || 'unknown'}`;
   }
-  return `qq:channel:${sanitizeText(context.channelId) || 'unknown'}`;
+  return `qq:${botId}:channel:${sanitizeText(context.channelId) || 'unknown'}`;
 }
 
 function hydratePersistedCodexSessions(persistedState) {
@@ -2587,7 +2816,7 @@ function getHelpMessage() {
     '',
     '【基础】',
     '/help - 查看帮助',
-    '/status - 查看运行状态（后端、连接、队列、目录、权限、最近 Token）',
+    '/status - 查看运行状态（当前接入的 bot/账号别称、所有 QQ 机器人 / 微信账号连接状态、后端、队列、目录、权限、最近 Token）',
     '/queue - 查看队列状态（当前任务、排队数、后端是否忙碌）',
     '/session - 查看当前聊天会话：后端、线程/Session ID、Token、待审批',
     '',
@@ -2621,16 +2850,33 @@ function getHelpMessage() {
   ].join('\n');
 }
 
+function formatClientStatuses(entries, emptyLabel) {
+  if (entries.length === 0) return emptyLabel;
+  return entries.map(({ name, id, ready }) => {
+    const label = name && name !== id ? `${name}（${id}）` : id;
+    return `${label}${ready ? ' ✓' : ' ✗'}`;
+  }).join('，');
+}
+
 function getStatusMessage(context) {
   const scopeKey = getContextSessionScopeKey(context);
   const backend = getActiveBackend(scopeKey);
   const currentSession = getSessionForContext(context, runnerState.workdir, backend);
   const tokenUsage = ensureSessionTokenUsage(currentSession);
+  const qqEntries = Array.from(qqBots.values()).map((b) => ({ id: b.id, name: b.name, ready: b.ready }));
+  const weixinEntries = Array.from(weixinBots.values()).map((b) => ({ id: b.accountId, name: b.name, ready: b.ready }));
+  const activeBotId = sanitizeText(context && context.botId);
+  const activeAccountId = sanitizeText(context && context.accountId);
+  const activeQQBot = activeBotId ? qqBots.get(activeBotId) : null;
+  const activeWeixinBot = activeAccountId ? weixinBots.get(activeAccountId) : null;
+  const currentClientLabel = context && context.platform === 'weixin'
+    ? `微信 ${activeWeixinBot ? activeWeixinBot.name : (activeAccountId || '(未知)')}`
+    : `QQ ${activeQQBot ? activeQQBot.name : (activeBotId || '(未知)')}`;
   const lines = [
     '运行状态：',
-    `QQ 已连接：${qqBot ? (qqBot.ready ? '是' : '否') : '否'}`,
-    `微信已启用：${weixinBot ? '是' : '否'}`,
-    `微信已连接：${weixinBot ? (weixinBot.ready ? '是' : '否') : '否'}`,
+    `当前接入：${currentClientLabel}`,
+    `QQ 机器人：${formatClientStatuses(qqEntries, '未配置')}`,
+    `微信账号：${WEIXIN_ENABLED ? formatClientStatuses(weixinEntries, '无已登录账号') : '已禁用'}`,
     `当前后端：${BACKEND_LABELS[backend]}`,
     `后端忙碌中：${codexProcess.busy ? '是' : '否'}`,
     `当前目录会话已建立：${currentSession.hasConversation ? '是' : '否'}`,
@@ -2752,9 +2998,9 @@ function extractWeixinText(message) {
   return '';
 }
 
-function buildContext(eventType, message) {
+function buildContext(eventType, message, source = {}) {
   if (eventType === 'WEIXIN_MESSAGE_CREATE') {
-    const accountId = weixinBot ? weixinBot.accountId : 'default';
+    const accountId = sanitizeText(source.accountId) || 'default';
     const peerId = sanitizeText(message && message.from_user_id);
     return {
       platform: 'weixin',
@@ -2769,31 +3015,30 @@ function buildContext(eventType, message) {
     };
   }
 
+  const botId = sanitizeText(source.botId) || 'default';
+
   if (eventType === 'C2C_MESSAGE_CREATE') {
+    const openid =
+      message && message.author
+        ? message.author.user_openid || message.author.union_openid || message.author.id
+        : null;
     return {
       platform: 'qq',
       type: 'c2c',
-      openid:
-        message && message.author
-          ? message.author.user_openid || message.author.union_openid || message.author.id
-          : null,
+      botId,
+      openid,
       messageId: message.id,
-      sessionScopeKey: `qq:c2c:${
-        sanitizeText(
-          message && message.author
-            ? message.author.user_openid || message.author.union_openid || message.author.id
-            : ''
-        ) || 'unknown'
-      }`
+      sessionScopeKey: `qq:${botId}:c2c:${sanitizeText(openid) || 'unknown'}`
     };
   }
 
   return {
     platform: 'qq',
     type: 'channel',
+    botId,
     channelId: message.channel_id,
     messageId: message.id,
-    sessionScopeKey: `qq:channel:${sanitizeText(message && message.channel_id) || 'unknown'}`
+    sessionScopeKey: `qq:${botId}:channel:${sanitizeText(message && message.channel_id) || 'unknown'}`
   };
 }
 
@@ -2801,19 +3046,27 @@ async function sendReply(context, content) {
   const parts = splitMessage(content, MAX_BOT_MESSAGE_LENGTH);
   for (const part of parts) {
     if (context.platform === 'weixin') {
-      if (!weixinBot) {
-        throw new Error('Weixin client is not configured.');
+      const accountId = sanitizeText(context.accountId);
+      const client = accountId ? weixinBots.get(accountId) : null;
+      if (!client) {
+        throw new Error(`Weixin client is not configured for account: ${accountId || '(unknown)'}`);
       }
-      await weixinBot.sendTextMessage(
+      await client.sendTextMessage(
         context.peerId,
         part,
-        weixinBot.getContextToken(context.peerId) || context.contextToken || null
+        client.getContextToken(context.peerId) || context.contextToken || null
       );
       continue;
     }
 
+    const botId = sanitizeText(context.botId);
+    const qqClient = botId ? qqBots.get(botId) : null;
+    if (!qqClient) {
+      throw new Error(`QQ bot is not configured for id: ${botId || '(unknown)'}`);
+    }
+
     if (context.type === 'c2c') {
-      await qqBot.sendC2CMessage(context.openid, {
+      await qqClient.sendC2CMessage(context.openid, {
         content: part,
         msg_id: context.messageId,
         msg_type: 0,
@@ -2822,7 +3075,7 @@ async function sendReply(context, content) {
       continue;
     }
 
-    await qqBot.sendChannelMessage(context.channelId, {
+    await qqClient.sendChannelMessage(context.channelId, {
       content: part,
       msg_id: context.messageId
     });
@@ -3544,7 +3797,7 @@ async function processQueue() {
   }
 }
 
-async function enqueueMessage(eventType, message) {
+async function enqueueMessage(eventType, message, source = {}) {
   if (!message) return;
 
   let input = '';
@@ -3554,7 +3807,8 @@ async function enqueueMessage(eventType, message) {
   } else {
     if (!message.author) return;
     if (message.author.bot) return;
-    if (String(message.author.id || '') === String(qqBot.appId)) return;
+    const sourceBot = qqBots.get(sanitizeText(source.botId));
+    if (sourceBot && String(message.author.id || '') === String(sourceBot.appId)) return;
 
     const rawContent = sanitizeText(message.content);
     input = eventType === 'AT_MESSAGE_CREATE' ? stripAtMentions(rawContent) : rawContent;
@@ -3562,9 +3816,10 @@ async function enqueueMessage(eventType, message) {
 
   if (!input) return;
 
-  const context = buildContext(eventType, message);
-  if (context.platform === 'weixin' && weixinBot && context.contextToken) {
-    weixinBot.setContextToken(context.peerId, context.contextToken);
+  const context = buildContext(eventType, message, source);
+  if (context.platform === 'weixin' && context.contextToken) {
+    const client = weixinBots.get(context.accountId);
+    if (client) client.setContextToken(context.peerId, context.contextToken);
   }
   const [commandWord, ...restParts] = input.split(/\s+/);
   const commandArg = restParts.join(' ').trim();
@@ -3682,8 +3937,17 @@ async function enqueueMessage(eventType, message) {
 }
 
 async function startRunner() {
-  qqBot = createQQBotClient();
-  qqBot.onMessage(enqueueMessage);
+  const qqConfigs = loadQQBotConfigs();
+  migrateLegacyQQSessions(qqConfigs);
+
+  for (const config of qqConfigs) {
+    const client = createQQBotClientFromConfig(config);
+    client.onMessage((eventType, message) => {
+      void enqueueMessage(eventType, message, { botId: client.id });
+    });
+    qqBots.set(client.id, client);
+  }
+
   startRunnerStateWatcher();
 
   for (const signalName of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
@@ -3694,22 +3958,38 @@ async function startRunner() {
         } catch (_) {}
       }
       stopRunnerStateWatcher();
-      if (weixinBot) {
-        await weixinBot.close();
+      const closes = [];
+      for (const bot of weixinBots.values()) {
+        closes.push(Promise.resolve(bot.close()).catch(() => {}));
       }
-      await qqBot.close();
+      for (const bot of qqBots.values()) {
+        closes.push(Promise.resolve(bot.close()).catch(() => {}));
+      }
+      await Promise.all(closes);
       process.exit(0);
     });
   }
 
-  await qqBot.connect();
-  log('QQ bot connected.');
-  await refreshWeixinClient();
+  for (const [id, client] of qqBots.entries()) {
+    const label = client.name && client.name !== id ? `${client.name}（${id}）` : id;
+    try {
+      await client.connect();
+      log(`QQ bot connected: ${label}`);
+    } catch (error) {
+      log(
+        `QQ bot ${label} failed to connect: ${
+          error && error.message ? error.message : String(error)
+        }`
+      );
+    }
+  }
+
+  await refreshWeixinClients();
 }
 
 async function main() {
   if (mode === 'weixin-login') {
-    const exitCode = await runWeixinLoginFlow(weixinAccountId, weixinLoginForce);
+    const exitCode = await runWeixinLoginFlow(weixinAccountId, weixinLoginForce, weixinName);
     process.exit(exitCode);
     return;
   }

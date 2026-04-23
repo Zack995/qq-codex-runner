@@ -15,11 +15,12 @@ X: [@btc_cczzc](https://x.com/btc_cczzc)
 
 ## 主要能力
 
-- 同一个进程同时支持 QQ 和微信
+- 同一个进程同时支持多 QQ 机器人和多微信账号，互不串扰
+- 每个 bot / 账号可以起别称（在 `/status` 和日志里直观区分）
 - 支持 QQ 频道消息和 C2C 私聊
 - 支持通过微信后端 HTTP API 接入微信文本消息
 - 双后端：`codex exec --json`（复用 `threadId`）和 `claude -p --output-format stream-json`（复用 `session_id`）
-- 按「渠道 + 对话对象 + 工作目录 + 后端」独立缓存会话，各后端互不覆盖
+- 按「bot/account + 对话对象 + 工作目录 + 后端」独立缓存会话，任一维度不同即是独立会话
 - 切换后端前自动检测 CLI 可用性（未安装硬拒绝、未登录仅警告）
 - 运行时捕获到认证错误会在回复里附带排查提示
 - 进程重启后恢复上次工作目录、权限模式、各 scope 的后端选择和已知会话
@@ -45,12 +46,35 @@ npm install
 cp .env.example .env
 ```
 
-最少配置：
+最少配置（单 QQ 机器人）：
 
 ```env
 QQ_BOT_APP_ID=your_app_id
 QQ_BOT_SECRET=your_app_secret
 ```
+
+多 QQ 机器人（`QQ_BOTS` 优先于 `QQ_BOT_APP_ID`）：
+
+```env
+QQ_BOTS=[{"id":"main","name":"主号","appId":"111","secret":"aaa"},{"id":"test","name":"测试号","appId":"222","secret":"bbb"}]
+```
+
+- `id` 是 session 隔离键；多机器人时不同 `id` 下的会话互不影响
+- `name` 是展示用的别称（`/status`、日志里能看到），省略则回落到 `id`
+- 升级前已有的会话若只配一个机器人，启动时会自动迁移到该 `id` 下；配了多个则保守丢弃（参见下文"运行逻辑"）
+
+单机器人用 legacy 配置时，别称默认叫 **`qq机器人`**；想改成别的，设 `QQ_BOT_NAME=xxx`。
+
+微信支持多账号：
+
+```bash
+node main.js --weixin-login --weixin-account work --weixin-name 工作号
+```
+
+- 登录成功后下次启动自动拉起
+- `WEIXIN_ACCOUNTS=a,b` 作为白名单只启一部分
+- `WEIXIN_NAMES={"default":"微信机器人","work":"工作号"}` 可在 env 层批量覆盖别称
+- 默认 `default` 账号的别称是 **`微信机器人`**，其他账号默认用 `accountId` 本身
 
 常用配置：
 
@@ -123,11 +147,13 @@ tail -f logs/runner.log
 ./scripts/stop.sh
 ```
 
-正常启动后，日志里应出现：
+正常启动后，日志里应出现（单机器人别称默认叫 `qq机器人`）：
 
 ```text
-[qq-codex-runner] QQ bot connected.
+[qq-codex-runner] QQ bot connected: qq机器人（1903879189）
 ```
+
+配置了多机器人时，每个机器人会各自打印一行；微信账号会打印 `Starting Weixin client for account <id>.`。
 
 ## 微信登录
 
@@ -141,13 +167,18 @@ node main.js --weixin-login
 
 ```bash
 node main.js --weixin-login --weixin-account default
+node main.js --weixin-login --weixin-account work --weixin-name 工作号
 node main.js --weixin-login --weixin-login-force
 node main.js --weixin-logout --weixin-account default
 ```
 
+- `--weixin-name <别称>` 在扫码的同时把别称写入 state；之后在 `/status` 里显示
+- 不传 `--weixin-name` 时，`default` 账号的别称默认为 `微信机器人`，其他账号默认为 `accountId`
+- 需要批量改别称也可以设 env `WEIXIN_NAMES={"default":"微信机器人","work":"工作号"}`（env 优先级高于 state）
+
 扫码登录成功后：
 
-- runner 会保存 `accountId`、`token`、`baseUrl`
+- runner 会保存 `accountId`、`name`、`token`、`baseUrl`
 - 正在运行的服务会自动热加载微信客户端
 - 不需要重启 `./scripts/start.sh`
 
@@ -189,7 +220,9 @@ node main.js --weixin-logout --weixin-account default
 ## 运行逻辑
 
 - 同一工作目录下，QQ、微信和手动终端里的 `codex` / `claude` 默认彼此隔离
-- 会话按「渠道 + 对话对象 + 工作目录 + 后端」缓存，四个维度任一不同就是独立会话
+- 同时支持多 QQ 机器人和多微信账号；每条消息带着来源 bot/account 进入队列，回复也由对应 client 发出，不会串号
+- 会话按「bot/account + 对话对象 + 工作目录 + 后端」缓存，任一维度不同就是独立会话（QQ 的 key 形如 `qq:{botId}:channel:X` 或 `qq:{botId}:c2c:X`，微信形如 `weixin:{accountId}:direct:X`）
+- 升级后启动时，若检测到老格式会话（`qq:channel:X` 无 botId）且只配了一个 QQ 机器人，自动迁移到该 `id` 下；配了多个则丢弃老会话并在日志提示
 - Codex 走 `codex exec --json`，复用 `threadId`；Claude 走 `claude -p --output-format stream-json --verbose`，复用 `session_id`
 - `/backend` 切换前会跑 `--version` 自检：不可执行直接拒绝；凭据缺失会附警告但仍允许切换
 - 运行时若 stderr 命中 `401 / unauthorized / invalid api key / not logged in / credential` 等关键词，错误回复会追加对应 CLI 的排查提示
