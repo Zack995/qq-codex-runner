@@ -58,9 +58,11 @@ fi
 screen -S "$SESSION_NAME" -X quit >/dev/null 2>&1 || true
 
 NODE_CMD="exec node main.js"
-for arg in "${NODE_ARGS[@]:-}"; do
-  NODE_CMD+=" $(printf '%q' "$arg")"
-done
+if [ ${#NODE_ARGS[@]} -ne 0 ]; then
+  for arg in "${NODE_ARGS[@]}"; do
+    NODE_CMD+=" $(printf '%q' "$arg")"
+  done
+fi
 
 screen -dmS "$SESSION_NAME" zsh -lc "echo \$\$ > '$PID_FILE' && $NODE_CMD >> '$LOG_FILE' 2>&1"
 
@@ -70,7 +72,7 @@ for _ in 1 2 3 4 5; do
     PID="$(cat "$PID_FILE" 2>/dev/null || true)"
     if [ -n "${PID}" ] && kill -0 "$PID" >/dev/null 2>&1; then
       echo "Started: $SESSION_NAME (pid $PID)"
-      if [ ${#NODE_ARGS[@]:-0} -gt 0 ]; then
+      if [ ${#NODE_ARGS[@]} -ne 0 ]; then
         echo "Args: ${NODE_ARGS[*]}"
       fi
       echo "Log: $LOG_FILE"
