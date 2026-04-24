@@ -463,6 +463,7 @@ class QQBotClient {
     this.ready = false;
     this.stopped = false;
     this.handlers = [];
+    this.seenMessageIds = new Map();
   }
 
   authorizationHeader() {
@@ -529,6 +530,22 @@ class QQBotClient {
   }
 
   dispatchMessage(eventType, message) {
+    const messageId = sanitizeText(message && (message.id || message.message_id));
+    if (messageId) {
+      const now = Date.now();
+      for (const [id, ts] of this.seenMessageIds) {
+        if (now - ts > 60_000) {
+          this.seenMessageIds.delete(id);
+        } else {
+          break;
+        }
+      }
+      if (this.seenMessageIds.has(messageId)) {
+        log(`QQ bot ${this.id} duplicate event ${eventType} / message ${messageId} ignored.`);
+        return;
+      }
+      this.seenMessageIds.set(messageId, now);
+    }
     for (const handler of this.handlers) {
       Promise.resolve(handler(eventType, message)).catch((error) => {
         log(`Message handler failed: ${error && error.message ? error.message : String(error)}`);
@@ -696,6 +713,7 @@ class WeixinClient {
     this.stopped = false;
     this.runningPromise = null;
     this.activePollController = null;
+    this.seenMessageIds = new Map();
   }
 
   onMessage(handler) {
@@ -703,6 +721,24 @@ class WeixinClient {
   }
 
   dispatchMessage(eventType, message) {
+    const messageId = sanitizeText(
+      message && (message.message_id || message.seq || message.session_id)
+    );
+    if (messageId) {
+      const now = Date.now();
+      for (const [id, ts] of this.seenMessageIds) {
+        if (now - ts > 60_000) {
+          this.seenMessageIds.delete(id);
+        } else {
+          break;
+        }
+      }
+      if (this.seenMessageIds.has(messageId)) {
+        log(`Weixin ${this.accountId} duplicate event ${eventType} / message ${messageId} ignored.`);
+        return;
+      }
+      this.seenMessageIds.set(messageId, now);
+    }
     for (const handler of this.handlers) {
       Promise.resolve(handler(eventType, message)).catch((error) => {
         log(`Weixin message handler failed: ${error && error.message ? error.message : String(error)}`);
@@ -1878,7 +1914,7 @@ const VALID_BACKENDS = new Set(['codex', 'claude']);
 const BACKEND_LABELS = { codex: 'Codex', claude: 'Claude Code' };
 const DEFAULT_BACKEND = (() => {
   const raw = sanitizeText(process.env.RUNNER_DEFAULT_BACKEND).toLowerCase();
-  return VALID_BACKENDS.has(raw) ? raw : 'codex';
+  return VALID_BACKENDS.has(raw) ? raw : 'claude';
 })();
 const CLAUDE_BIN = sanitizeText(process.env.CLAUDE_BIN) || 'claude';
 const RUNNER_CLAUDE_HOME = (() => {

@@ -134,7 +134,7 @@ CODEX_AUTO_COMPACT_TOKEN_LIMIT=500000
 CLAUDE_BIN=claude
 RUNNER_CLAUDE_HOME=../.claude-qq-runner
 
-# 新会话默认后端（不设则为 codex）
+# 新会话默认后端（不设则为 claude）
 RUNNER_DEFAULT_BACKEND=claude
 
 # 通用
