@@ -45,10 +45,16 @@ function loadDotEnv(filename = '.env') {
 function usage(exitCode = 1) {
   const message = [
     'Usage:',
-    '  qq-codex-runner [--cmd <codex-bin>] -- <codex args...>',
+    '  qq-codex-runner [--cmd <codex-bin>] [--full | --force-access <mode>] -- <codex args...>',
     '  qq-codex-runner --weixin-login [--weixin-account <id>] [--weixin-name <alias>] [--weixin-login-force]',
     '  qq-codex-runner --weixin-logout [--weixin-account <id>]',
-    '  qq-codex-runner --help'
+    '  qq-codex-runner --help',
+    '',
+    'Options:',
+    '  --full               Boot with every session forced to access-mode=full',
+    '                       (clears any per-scope /access overrides; equivalent to',
+    '                        --force-access full)',
+    '  --force-access <m>   Same as --full, but with a chosen mode (read|write|safe|full)'
   ].join('\n');
   process.stderr.write(`${message}\n`);
   process.exit(exitCode);
@@ -727,12 +733,19 @@ class WeixinClient {
   }
 
   setSyncCursor(cursor) {
-    weixinState.syncCursor = sanitizeText(cursor);
+    const normalized = sanitizeText(cursor);
+    if (!weixinState.syncCursors) weixinState.syncCursors = {};
+    if (normalized) {
+      weixinState.syncCursors[this.accountId] = normalized;
+    } else {
+      delete weixinState.syncCursors[this.accountId];
+    }
     persistRunnerState();
   }
 
   getSyncCursor() {
-    return sanitizeText(weixinState.syncCursor);
+    if (!weixinState.syncCursors) return '';
+    return sanitizeText(weixinState.syncCursors[this.accountId]);
   }
 
   setContextToken(peerId, token) {
@@ -911,6 +924,7 @@ function parseArgs(argv) {
   let weixinAccountId = sanitizeText(process.env.WEIXIN_ACCOUNT_ID || 'default') || 'default';
   let weixinLoginForce = false;
   let weixinName = '';
+  let forceAccessMode = '';
 
   for (let index = 0; index < runnerArgs.length; index += 1) {
     const token = runnerArgs[index];
@@ -948,10 +962,21 @@ function parseArgs(argv) {
       index += 1;
       continue;
     }
+    if (token === '--full') {
+      forceAccessMode = 'full';
+      continue;
+    }
+    if (token === '--force-access') {
+      const next = runnerArgs[index + 1];
+      if (!next) usage(1);
+      forceAccessMode = sanitizeText(next).toLowerCase();
+      index += 1;
+      continue;
+    }
     usage(1);
   }
 
-  return { command, codexArgs, mode, weixinAccountId, weixinLoginForce, weixinName };
+  return { command, codexArgs, mode, weixinAccountId, weixinLoginForce, weixinName, forceAccessMode };
 }
 
 function parseExecJsonEvents(output) {
@@ -1581,38 +1606,27 @@ function normalizeQQBotEntry(entry, index, seenIds) {
 
 function loadQQBotConfigs() {
   const raw = sanitizeText(process.env.QQ_BOTS);
-  if (raw) {
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (error) {
-      process.stderr.write(`Invalid QQ_BOTS JSON: ${error && error.message ? error.message : error}\n`);
-      process.exit(1);
-    }
-    if (!Array.isArray(parsed) || parsed.length === 0) {
-      process.stderr.write('QQ_BOTS must be a non-empty JSON array.\n');
-      process.exit(1);
-    }
-    const seenIds = new Set();
-    return parsed.map((entry, index) => normalizeQQBotEntry(entry, index, seenIds));
+  if (!raw) {
+    process.stderr.write(
+      'QQ_BOTS is required. Set it to a JSON array of bot configs, e.g.\n' +
+      '  QQ_BOTS=[{"id":"main","name":"主号","appId":"111","secret":"aaa"}]\n'
+    );
+    process.exit(1);
   }
 
-  const appId = requireEnv('QQ_BOT_APP_ID');
-  const secret =
-    process.env.QQ_BOT_SECRET ||
-    process.env.QQ_BOT_CLIENT_SECRET ||
-    requireEnv('QQ_BOT_SECRET');
-
-  return [{
-    id: appId,
-    name: sanitizeText(process.env.QQ_BOT_NAME) || 'qq机器人',
-    appId,
-    secret,
-    intents: parseIntents(process.env.QQ_BOT_INTENTS),
-    apiBase:
-      process.env.QQ_BOT_API_BASE || defaultQQApiBase(process.env.QQ_BOT_SANDBOX),
-    tokenBase: process.env.QQ_BOT_TOKEN_BASE || 'https://bots.qq.com'
-  }];
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    process.stderr.write(`Invalid QQ_BOTS JSON: ${error && error.message ? error.message : error}\n`);
+    process.exit(1);
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    process.stderr.write('QQ_BOTS must be a non-empty JSON array.\n');
+    process.exit(1);
+  }
+  const seenIds = new Set();
+  return parsed.map((entry, index) => normalizeQQBotEntry(entry, index, seenIds));
 }
 
 function createQQBotClientFromConfig(config) {
@@ -1792,8 +1806,9 @@ const APPROVAL_POLICY_PROMPT = [
   'When the user replies /reject, cancel the current task.'
 ].join('\n');
 
-function buildAgentPolicyPrompt() {
-  if (runnerState.accessMode === 'full') {
+function buildAgentPolicyPrompt(accessMode) {
+  const mode = sanitizeText(accessMode).toLowerCase() || runnerState.accessMode;
+  if (mode === 'full') {
     return [
       '你正在通过聊天机器人与用户协作。',
       '当前权限模式是完全访问。',
@@ -1814,7 +1829,7 @@ function buildApprovalPrompt(action, pendingApproval, options = {}) {
 
 loadDotEnv();
 
-const { command, codexArgs, mode, weixinAccountId, weixinLoginForce, weixinName } = parseArgs(process.argv.slice(2));
+const { command, codexArgs, mode, weixinAccountId, weixinLoginForce, weixinName, forceAccessMode } = parseArgs(process.argv.slice(2));
 const qqBots = new Map();
 const WEIXIN_ENABLED = parseBoolean(process.env.WEIXIN_ENABLED, true);
 
@@ -1892,14 +1907,13 @@ const MAX_CONCURRENCY =
     : DEFAULT_MAX_CONCURRENCY;
 let runnerState = {
   workdir: initialRunnerState.workdir,
+  workdirs: { ...(initialRunnerState.workdirs || {}) },
   accessMode: initialRunnerState.accessMode,
+  accessModes: { ...(initialRunnerState.accessModes || {}) },
   addDirs: DEFAULT_ADD_DIRS.slice(),
   backends: { ...(initialRunnerState.backends || {}) }
 };
-let recentWorkdirSearch = {
-  query: '',
-  matches: []
-};
+const recentWorkdirSearches = new Map();
 let weixinState = deriveInitialWeixinState(persistedRunnerState);
 const weixinBots = new Map();
 let runnerStateWatcher = null;
@@ -1907,9 +1921,10 @@ let runnerStateWatcher = null;
 function buildChatTurnPrompt(input, options = {}) {
   const includePolicy = options.includePolicy !== false;
   const backend = options.backend || 'codex';
+  const accessMode = options.accessMode;
   const parts = [];
   if (includePolicy && backend === 'codex') {
-    parts.push(buildAgentPolicyPrompt(), '');
+    parts.push(buildAgentPolicyPrompt(accessMode), '');
   }
   parts.push(`[User message]\n${input}\n[/User message]`);
   return parts.join('\n');
@@ -1917,9 +1932,10 @@ function buildChatTurnPrompt(input, options = {}) {
 
 function buildApprovalTurnPrompt(action, approval, options = {}) {
   const includePolicy = options.includePolicy !== false;
+  const accessMode = options.accessMode;
   const parts = [];
   if (includePolicy) {
-    parts.push(buildAgentPolicyPrompt(), '');
+    parts.push(buildAgentPolicyPrompt(accessMode), '');
   }
 
   if (!approval) {
@@ -2018,6 +2034,39 @@ function getActiveBackend(scopeKey) {
   return DEFAULT_BACKEND;
 }
 
+function getWorkdirForScope(scopeKey) {
+  const key = sanitizeText(scopeKey);
+  if (key && runnerState.workdirs && runnerState.workdirs[key]) {
+    return runnerState.workdirs[key];
+  }
+  return runnerState.workdir;
+}
+
+function setWorkdirForScope(scopeKey, workdir) {
+  const key = sanitizeText(scopeKey);
+  const resolved = sanitizeText(workdir);
+  if (!key || !resolved) return;
+  if (!runnerState.workdirs) runnerState.workdirs = {};
+  runnerState.workdirs[key] = resolved;
+}
+
+function getAccessModeForScope(scopeKey) {
+  const key = sanitizeText(scopeKey);
+  if (key && runnerState.accessModes) {
+    const stored = sanitizeText(runnerState.accessModes[key]).toLowerCase();
+    if (stored && VALID_ACCESS_MODES.has(stored)) return stored;
+  }
+  return runnerState.accessMode;
+}
+
+function setAccessModeForScope(scopeKey, mode) {
+  const key = sanitizeText(scopeKey);
+  const normalized = sanitizeText(mode).toLowerCase();
+  if (!key || !VALID_ACCESS_MODES.has(normalized)) return;
+  if (!runnerState.accessModes) runnerState.accessModes = {};
+  runnerState.accessModes[key] = normalized;
+}
+
 function setActiveBackend(scopeKey, backend) {
   const key = sanitizeText(scopeKey);
   const normalized = sanitizeText(backend).toLowerCase();
@@ -2096,7 +2145,7 @@ function loadPersistedRunnerState() {
 
 function deriveInitialWeixinState(persistedState) {
   const state = {
-    syncCursor: '',
+    syncCursors: {},
     contextTokens: {},
     accounts: {},
     defaultAccountId: 'default'
@@ -2106,9 +2155,14 @@ function deriveInitialWeixinState(persistedState) {
     return state;
   }
 
-  const nextCursor = sanitizeText(persistedState.weixin.syncCursor);
-  if (nextCursor) {
-    state.syncCursor = nextCursor;
+  if (persistedState.weixin.syncCursors && typeof persistedState.weixin.syncCursors === 'object') {
+    for (const [accountId, cursor] of Object.entries(persistedState.weixin.syncCursors)) {
+      const normalizedAccountId = sanitizeText(accountId);
+      const normalizedCursor = sanitizeText(cursor);
+      if (normalizedAccountId && normalizedCursor) {
+        state.syncCursors[normalizedAccountId] = normalizedCursor;
+      }
+    }
   }
 
   if (persistedState.weixin.contextTokens && typeof persistedState.weixin.contextTokens === 'object') {
@@ -2216,69 +2270,6 @@ function syncWeixinStateFromDisk() {
   const latestState = loadPersistedRunnerState();
   if (!latestState) return;
   weixinState = deriveInitialWeixinState(latestState);
-}
-
-function migrateLegacyQQSessions(qqConfigs) {
-  if (!Array.isArray(qqConfigs) || qqConfigs.length === 0) return;
-
-  const legacyPattern = /^qq:(channel|c2c):(.*)$/;
-
-  const legacySessions = [];
-  for (const [key, session] of codexSessions.entries()) {
-    if (!session || !session.scopeKey) continue;
-    const match = session.scopeKey.match(legacyPattern);
-    if (!match) continue;
-    legacySessions.push({ key, session, kind: match[1], tail: match[2] });
-  }
-
-  const backendKeys = runnerState.backends && typeof runnerState.backends === 'object'
-    ? Object.keys(runnerState.backends)
-    : [];
-  const legacyBackendKeys = backendKeys.filter((k) => legacyPattern.test(k));
-
-  if (legacySessions.length === 0 && legacyBackendKeys.length === 0) return;
-
-  if (qqConfigs.length > 1) {
-    if (legacySessions.length > 0) {
-      log(
-        `Dropping ${legacySessions.length} legacy QQ session(s) (pre-multi-bot format): ` +
-        'multiple QQ_BOTS configured, cannot auto-assign. Use /restart or reconfigure with a single bot to migrate.'
-      );
-      for (const { key } of legacySessions) {
-        codexSessions.delete(key);
-      }
-    }
-    for (const oldKey of legacyBackendKeys) {
-      delete runnerState.backends[oldKey];
-    }
-    persistRunnerState();
-    return;
-  }
-
-  const botId = qqConfigs[0].id;
-
-  for (const { key, session, kind, tail } of legacySessions) {
-    const newScopeKey = `qq:${botId}:${kind}:${tail}`;
-    const newKey = buildSessionIdentity(newScopeKey, session.workdir, session.backend);
-    codexSessions.delete(key);
-    session.scopeKey = newScopeKey;
-    codexSessions.set(newKey, session);
-  }
-
-  for (const oldKey of legacyBackendKeys) {
-    const match = oldKey.match(legacyPattern);
-    if (!match) continue;
-    const newKey = `qq:${botId}:${match[1]}:${match[2]}`;
-    runnerState.backends[newKey] = runnerState.backends[oldKey];
-    delete runnerState.backends[oldKey];
-  }
-
-  if (legacySessions.length > 0 || legacyBackendKeys.length > 0) {
-    log(
-      `Migrated ${legacySessions.length} legacy QQ session(s) and ${legacyBackendKeys.length} backend selection(s) to bot id: ${botId}`
-    );
-    persistRunnerState();
-  }
 }
 
 function getDesiredWeixinAccounts() {
@@ -2390,7 +2381,9 @@ function deriveInitialRunnerState(persistedState) {
   const fallbackAccessMode = sanitizeText(process.env.CODEX_ACCESS_MODE || 'safe').toLowerCase();
   const nextState = {
     workdir: DEFAULT_WORKDIR,
+    workdirs: {},
     accessMode: fallbackAccessMode,
+    accessModes: {},
     backends: {}
   };
 
@@ -2411,6 +2404,25 @@ function deriveInitialRunnerState(persistedState) {
       if (!normalizedScope) continue;
       if (!VALID_BACKENDS.has(normalizedBackend)) continue;
       nextState.backends[normalizedScope] = normalizedBackend;
+    }
+  }
+
+  if (persistedState && persistedState.accessModes && typeof persistedState.accessModes === 'object') {
+    for (const [scope, mode] of Object.entries(persistedState.accessModes)) {
+      const normalizedScope = sanitizeText(scope);
+      const normalizedMode = sanitizeText(mode).toLowerCase();
+      if (!normalizedScope) continue;
+      if (!VALID_ACCESS_MODES.has(normalizedMode)) continue;
+      nextState.accessModes[normalizedScope] = normalizedMode;
+    }
+  }
+
+  if (persistedState && persistedState.workdirs && typeof persistedState.workdirs === 'object') {
+    for (const [scope, workdir] of Object.entries(persistedState.workdirs)) {
+      const normalizedScope = sanitizeText(scope);
+      const resolved = resolveExistingDirectory(workdir);
+      if (!normalizedScope || !resolved) continue;
+      nextState.workdirs[normalizedScope] = resolved;
     }
   }
 
@@ -2554,14 +2566,32 @@ function buildPersistedRunnerState() {
     }
   }
 
+  const sortedWorkdirs = {};
+  if (runnerState.workdirs && typeof runnerState.workdirs === 'object') {
+    for (const scope of Object.keys(runnerState.workdirs).sort()) {
+      const value = sanitizeText(runnerState.workdirs[scope]);
+      if (value) sortedWorkdirs[scope] = value;
+    }
+  }
+
+  const sortedAccessModes = {};
+  if (runnerState.accessModes && typeof runnerState.accessModes === 'object') {
+    for (const scope of Object.keys(runnerState.accessModes).sort()) {
+      const value = sanitizeText(runnerState.accessModes[scope]).toLowerCase();
+      if (VALID_ACCESS_MODES.has(value)) sortedAccessModes[scope] = value;
+    }
+  }
+
   return {
-    version: 3,
+    version: 4,
     workdir: runnerState.workdir,
+    workdirs: sortedWorkdirs,
     accessMode: runnerState.accessMode,
+    accessModes: sortedAccessModes,
     backends: sortedBackends,
     codexSessions: sessionRecords,
     weixin: {
-      syncCursor: weixinState.syncCursor,
+      syncCursors: { ...(weixinState.syncCursors || {}) },
       contextTokens: { ...weixinState.contextTokens },
       accounts: { ...weixinState.accounts },
       defaultAccountId: weixinState.defaultAccountId
@@ -2599,8 +2629,10 @@ function resetSessionState(session) {
   session.generation += 1;
 }
 
-function getSessionForContext(context, workdir = runnerState.workdir, backend) {
-  return getScopedSession(getContextSessionScopeKey(context), workdir, backend);
+function getSessionForContext(context, workdir, backend) {
+  const scopeKey = getContextSessionScopeKey(context);
+  const resolvedWorkdir = workdir || getWorkdirForScope(scopeKey);
+  return getScopedSession(scopeKey, resolvedWorkdir, backend);
 }
 
 function stopActiveRun(sessionKey, signal = 'SIGTERM') {
@@ -2665,7 +2697,7 @@ function findPendingApprovalByScope(scopeKey) {
 function sessionIdentityForContext(context, backend) {
   const scopeKey = getContextSessionScopeKey(context);
   const resolvedBackend = backend || getActiveBackend(scopeKey);
-  return buildSessionIdentity(scopeKey, runnerState.workdir, resolvedBackend);
+  return buildSessionIdentity(scopeKey, getWorkdirForScope(scopeKey), resolvedBackend);
 }
 
 function sessionIdentityForTask(task) {
@@ -2676,11 +2708,27 @@ function sessionIdentityForTask(task) {
   );
 }
 
-function clearRecentWorkdirSearch() {
-  recentWorkdirSearch = {
-    query: '',
-    matches: []
-  };
+function clearRecentWorkdirSearch(scopeKey) {
+  const key = sanitizeText(scopeKey);
+  if (key) {
+    recentWorkdirSearches.delete(key);
+  }
+}
+
+function clearAllRecentWorkdirSearches() {
+  recentWorkdirSearches.clear();
+}
+
+function setRecentWorkdirSearch(scopeKey, query, matches) {
+  const key = sanitizeText(scopeKey);
+  if (!key) return;
+  recentWorkdirSearches.set(key, { query: sanitizeText(query), matches: Array.isArray(matches) ? matches : [] });
+}
+
+function getRecentWorkdirSearch(scopeKey) {
+  const key = sanitizeText(scopeKey);
+  if (!key) return null;
+  return recentWorkdirSearches.get(key) || null;
 }
 
 function getWorkdirSearchRoots() {
@@ -2851,12 +2899,14 @@ function searchLocalDirectories(query, limit = MAX_WORKDIR_SEARCH_RESULTS) {
   return searchLocalDirectoriesByTraversal(query, limit);
 }
 
-function getSearchSelection(target) {
+function getSearchSelection(scopeKey, target) {
   const selection = sanitizeText(target);
   if (!/^\d+$/.test(selection)) return null;
   const index = Number(selection);
-  if (index < 1 || index > recentWorkdirSearch.matches.length) return null;
-  return recentWorkdirSearch.matches[index - 1];
+  const entry = getRecentWorkdirSearch(scopeKey);
+  if (!entry || !Array.isArray(entry.matches)) return null;
+  if (index < 1 || index > entry.matches.length) return null;
+  return entry.matches[index - 1];
 }
 
 function formatWorkdirSearchMessage(query, matches) {
@@ -2911,7 +2961,9 @@ function formatClientStatuses(entries, emptyLabel) {
 function getStatusMessage(context) {
   const scopeKey = getContextSessionScopeKey(context);
   const backend = getActiveBackend(scopeKey);
-  const currentSession = getSessionForContext(context, runnerState.workdir, backend);
+  const scopeWorkdir = getWorkdirForScope(scopeKey);
+  const scopeAccessMode = getAccessModeForScope(scopeKey);
+  const currentSession = getSessionForContext(context, scopeWorkdir, backend);
   const tokenUsage = ensureSessionTokenUsage(currentSession);
   const qqEntries = Array.from(qqBots.values()).map((b) => ({ id: b.id, name: b.name, ready: b.ready }));
   const weixinEntries = Array.from(weixinBots.values()).map((b) => ({ id: b.accountId, name: b.name, ready: b.ready }));
@@ -2938,8 +2990,8 @@ function getStatusMessage(context) {
     `当前目录会话已建立：${currentSession.hasConversation ? '是' : '否'}`,
     `已缓存目录会话：${countActiveSessions()}`,
     `存在待审批（当前聊天）：${callerPending ? '是' : '否'}`,
-    `工作目录：${runnerState.workdir}`,
-    `权限模式：${VALID_ACCESS_MODES.get(runnerState.accessMode).label}`
+    `工作目录：${scopeWorkdir}`,
+    `权限模式：${VALID_ACCESS_MODES.get(scopeAccessMode).label}（全局默认：${VALID_ACCESS_MODES.get(runnerState.accessMode).label}）`
   ];
 
   if (backend === 'codex') {
@@ -2956,7 +3008,7 @@ function getStatusMessage(context) {
       `自动压缩状态：${getCodexAutoCompactStatus()}`
     );
   } else {
-    const permissionMode = CLAUDE_PERMISSION_MODE_BY_ACCESS[runnerState.accessMode] || 'default';
+    const permissionMode = CLAUDE_PERMISSION_MODE_BY_ACCESS[scopeAccessMode] || 'default';
     lines.push(
       `Runner CLAUDE_CONFIG_DIR：${RUNNER_CLAUDE_HOME || '继承系统默认'}`,
       `Claude 权限模式：${permissionMode}`
@@ -2997,7 +3049,9 @@ function getQueueMessage() {
 function getSessionMessage(context) {
   const scopeKey = getContextSessionScopeKey(context);
   const backend = getActiveBackend(scopeKey);
-  const currentSession = getSessionForContext(context, runnerState.workdir, backend);
+  const scopeWorkdir = getWorkdirForScope(scopeKey);
+  const scopeAccessMode = getAccessModeForScope(scopeKey);
+  const currentSession = getSessionForContext(context, scopeWorkdir, backend);
   const tokenUsage = ensureSessionTokenUsage(currentSession);
   const threadLabel = backend === 'claude' ? 'Session ID' : '线程 ID';
   const callerSessionKey = sessionIdentityForContext(context, backend);
@@ -3016,8 +3070,8 @@ function getSessionMessage(context) {
     `当前目录${threadLabel}：${currentSession.threadId || '无'}`,
     `已缓存目录会话：${countActiveSessions()}`,
     `存在待审批（当前聊天）：${callerPending ? '是' : '否'}`,
-    `工作目录：${runnerState.workdir}`,
-    `权限模式：${VALID_ACCESS_MODES.get(runnerState.accessMode).label}`
+    `工作目录：${scopeWorkdir}`,
+    `权限模式：${VALID_ACCESS_MODES.get(scopeAccessMode).label}`
   ];
 
   if (backend === 'codex') {
@@ -3029,7 +3083,7 @@ function getSessionMessage(context) {
       })}`
     );
   } else {
-    const permissionMode = CLAUDE_PERMISSION_MODE_BY_ACCESS[runnerState.accessMode] || 'default';
+    const permissionMode = CLAUDE_PERMISSION_MODE_BY_ACCESS[scopeAccessMode] || 'default';
     lines.push(
       `Runner CLAUDE_CONFIG_DIR：${RUNNER_CLAUDE_HOME || '继承系统默认'}`,
       `Claude 权限模式：${permissionMode}`
@@ -3043,20 +3097,36 @@ function getSessionMessage(context) {
   return lines.join('\n');
 }
 
-function getWorkdirMessage() {
-  return [
+function getWorkdirMessage(context) {
+  const scopeKey = context ? getContextSessionScopeKey(context) : '';
+  const scopeWorkdir = scopeKey ? getWorkdirForScope(scopeKey) : runnerState.workdir;
+  const lines = [
     '工作目录状态：',
-    `当前目录：${runnerState.workdir}`,
-    runnerState.addDirs.length > 0 ? `附加可写目录：${runnerState.addDirs.join(', ')}` : '附加可写目录：无'
-  ].join('\n');
+    `当前聊天目录：${scopeWorkdir}`
+  ];
+  if (scopeWorkdir !== runnerState.workdir) {
+    lines.push(`全局默认：${runnerState.workdir}`);
+  }
+  lines.push(
+    runnerState.addDirs.length > 0
+      ? `附加可写目录：${runnerState.addDirs.join(', ')}`
+      : '附加可写目录：无'
+  );
+  return lines.join('\n');
 }
 
-function getAccessMessage() {
-  return [
+function getAccessMessage(context) {
+  const scopeKey = context ? getContextSessionScopeKey(context) : '';
+  const scopeMode = scopeKey ? getAccessModeForScope(scopeKey) : runnerState.accessMode;
+  const lines = [
     '权限模式：',
-    `当前模式：${VALID_ACCESS_MODES.get(runnerState.accessMode).label}`,
-    '可选模式：read / write / safe / full'
-  ].join('\n');
+    `当前聊天模式：${VALID_ACCESS_MODES.get(scopeMode).label}`
+  ];
+  if (scopeMode !== runnerState.accessMode) {
+    lines.push(`全局默认：${VALID_ACCESS_MODES.get(runnerState.accessMode).label}`);
+  }
+  lines.push('可选模式：read / write / safe / full');
+  return lines.join('\n');
 }
 
 function extractWeixinText(message) {
@@ -3226,9 +3296,10 @@ function createProgressReporter(context, parseEvent = extractProgressUpdateFromE
   };
 }
 
-function buildCodexArgs(prompt, outputFile, session, workdir) {
+function buildCodexArgs(prompt, outputFile, session, workdir, accessMode) {
   const args = ['exec'];
-  const accessConfig = VALID_ACCESS_MODES.get(runnerState.accessMode) || VALID_ACCESS_MODES.get('safe');
+  const mode = sanitizeText(accessMode).toLowerCase() || runnerState.accessMode;
+  const accessConfig = VALID_ACCESS_MODES.get(mode) || VALID_ACCESS_MODES.get('safe');
   args.push('-C', workdir);
   args.push('-s', accessConfig.sandbox);
   if (CODEX_CONTEXT_WINDOW_OVERRIDE) {
@@ -3252,11 +3323,11 @@ function buildCodexArgs(prompt, outputFile, session, workdir) {
   return args;
 }
 
-function runCodexExec(prompt, session, workdir, context, run) {
+function runCodexExec(prompt, session, workdir, context, run, accessMode) {
   return new Promise((resolve, reject) => {
     const generation = session.generation;
     const outputFile = path.join(os.tmpdir(), `qq-codex-runner-last-${process.pid}-${Date.now()}.txt`);
-    const args = buildCodexArgs(prompt, outputFile, session, workdir);
+    const args = buildCodexArgs(prompt, outputFile, session, workdir, accessMode);
     const progressReporter = createProgressReporter(context);
     const child = childProcess.spawn(command, args, {
       cwd: workdir,
@@ -3414,11 +3485,11 @@ function runCodexExec(prompt, session, workdir, context, run) {
   });
 }
 
-function buildClaudeArgs(prompt, session, workdir) {
+function buildClaudeArgs(prompt, session, workdir, accessMode) {
   void workdir;
   const args = ['-p', '--output-format', 'stream-json', '--verbose'];
-  const accessMode = runnerState.accessMode;
-  const permissionMode = CLAUDE_PERMISSION_MODE_BY_ACCESS[accessMode] || 'default';
+  const mode = sanitizeText(accessMode).toLowerCase() || runnerState.accessMode;
+  const permissionMode = CLAUDE_PERMISSION_MODE_BY_ACCESS[mode] || 'default';
   args.push('--permission-mode', permissionMode);
   for (const addDir of runnerState.addDirs) {
     args.push('--add-dir', addDir);
@@ -3438,10 +3509,10 @@ function summarizeClaudeFailure(stderr, stdout, events) {
   return combined.split('\n').slice(-12).join('\n');
 }
 
-function runClaudeExec(prompt, session, workdir, context, run) {
+function runClaudeExec(prompt, session, workdir, context, run, accessMode) {
   return new Promise((resolve, reject) => {
     const generation = session.generation;
-    const args = buildClaudeArgs(prompt, session, workdir);
+    const args = buildClaudeArgs(prompt, session, workdir, accessMode);
     const progressReporter = createProgressReporter(context, extractProgressUpdateFromClaudeEvent);
 
     const spawnEnv = {
@@ -3622,13 +3693,14 @@ function runClaudeExec(prompt, session, workdir, context, run) {
 }
 
 async function resetCodexSession(context) {
+  const scopeKey = getContextSessionScopeKey(context);
   const session = getSessionForContext(context);
   const sessionKey = buildSessionIdentity(session.scopeKey, session.workdir, session.backend);
   resetSessionState(session);
   pendingApprovals.delete(sessionKey);
   clearQueueForSession(sessionKey);
   stopActiveRun(sessionKey);
-  clearRecentWorkdirSearch();
+  clearRecentWorkdirSearch(scopeKey);
   persistRunnerState();
 
   await safeSendReply(context, '当前会话已重置，下一条消息会启动新的对话。');
@@ -3638,7 +3710,7 @@ async function restartRunner(context) {
   stopAllActiveRuns();
   pendingApprovals.clear();
   clearAllQueues();
-  clearRecentWorkdirSearch();
+  clearAllRecentWorkdirSearches();
   codexSessions.clear();
   persistRunnerState();
 
@@ -3647,23 +3719,24 @@ async function restartRunner(context) {
 
 async function switchWorkdir(context, rawDir, options = {}) {
   const resolved = resolveInputPath(rawDir);
-  const currentDir = runnerState.workdir;
+  const scopeKey = getContextSessionScopeKey(context);
+  const currentDir = getWorkdirForScope(scopeKey);
   const { fromSearchSelection = false } = options;
 
   if (resolved === currentDir) {
-    clearRecentWorkdirSearch();
+    clearRecentWorkdirSearch(scopeKey);
     await safeSendReply(context, `当前已经在该目录：${resolved}`);
     return;
   }
 
-  clearRecentWorkdirSearch();
-  runnerState.workdir = resolved;
+  clearRecentWorkdirSearch(scopeKey);
+  setWorkdirForScope(scopeKey, resolved);
   const targetSession = getSessionForContext(context, resolved);
   persistRunnerState();
 
   const switchHint = fromSearchSelection
-    ? '已根据搜索结果切换工作目录（热切，已在跑的任务按原目录跑完）。'
-    : '已切换工作目录（热切，已在跑的任务按原目录跑完）。';
+    ? '已根据搜索结果切换当前聊天的工作目录（热切，已在跑的任务按原目录跑完）。'
+    : '已切换当前聊天的工作目录（热切，已在跑的任务按原目录跑完）。';
   const sessionHint = targetSession.hasConversation
     ? '已恢复该目录之前的会话。'
     : '这是该目录的首次会话，下一条消息会新开对话。';
@@ -3673,7 +3746,7 @@ async function switchWorkdir(context, rawDir, options = {}) {
 async function handleWorkdirCommand(context, rawDir) {
   const target = sanitizeText(rawDir);
   if (!target) {
-    await safeSendReply(context, getWorkdirMessage());
+    await safeSendReply(context, getWorkdirMessage(context));
     return;
   }
 
@@ -3688,7 +3761,8 @@ async function handleWorkdirCommand(context, rawDir) {
     return;
   }
 
-  const selection = getSearchSelection(target);
+  const scopeKey = getContextSessionScopeKey(context);
+  const selection = getSearchSelection(scopeKey, target);
   if (selection) {
     await switchWorkdir(context, selection, { fromSearchSelection: true });
     return;
@@ -3700,10 +3774,7 @@ async function handleWorkdirCommand(context, rawDir) {
   }
 
   const matches = searchLocalDirectories(target);
-  recentWorkdirSearch = {
-    query: target,
-    matches
-  };
+  setRecentWorkdirSearch(scopeKey, target, matches);
   await safeSendReply(context, formatWorkdirSearchMessage(target, matches));
 }
 
@@ -3754,7 +3825,7 @@ async function handleBackendCommand(context, rawArg) {
   setActiveBackend(scopeKey, normalized);
   persistRunnerState();
   const suffix = check.warn ? `\n注意：${check.message}` : '';
-  const nextSession = getScopedSession(scopeKey, runnerState.workdir, normalized);
+  const nextSession = getScopedSession(scopeKey, getWorkdirForScope(scopeKey), normalized);
   const sessionHint = nextSession.hasConversation
     ? `已恢复该后端之前的会话（线程 ${nextSession.threadId || '未知'}）。`
     : '这是该后端的首次会话，下一条消息会新开对话。';
@@ -3764,7 +3835,7 @@ async function handleBackendCommand(context, rawArg) {
 async function switchAccessMode(context, rawMode) {
   const mode = sanitizeText(rawMode).toLowerCase();
   if (!mode) {
-    await safeSendReply(context, getAccessMessage());
+    await safeSendReply(context, getAccessMessage(context));
     return;
   }
 
@@ -3773,20 +3844,22 @@ async function switchAccessMode(context, rawMode) {
     return;
   }
 
-  if (runnerState.accessMode === mode) {
+  const scopeKey = getContextSessionScopeKey(context);
+  const current = getAccessModeForScope(scopeKey);
+  if (current === mode) {
     await safeSendReply(
       context,
-      `当前已是该权限模式：${VALID_ACCESS_MODES.get(mode).label}`
+      `当前聊天已是该权限模式：${VALID_ACCESS_MODES.get(mode).label}`
     );
     return;
   }
 
-  runnerState.accessMode = mode;
+  setAccessModeForScope(scopeKey, mode);
   persistRunnerState();
 
   await safeSendReply(
     context,
-    `权限模式已热切换为：${VALID_ACCESS_MODES.get(mode).label}\n已在跑的任务保持旧权限跑完；队列中未开始的任务以及下一条消息会以新权限启动。`
+    `当前聊天的权限模式已热切换为：${VALID_ACCESS_MODES.get(mode).label}\n已在跑的任务保持旧权限跑完；排队中的任务和下一条消息会以新权限启动；其他聊天不受影响。`
   );
 }
 
@@ -3796,6 +3869,8 @@ async function executeTask(task, run) {
     : (task.backend && VALID_BACKENDS.has(task.backend)
       ? task.backend
       : getActiveBackend(task.sessionScopeKey));
+  const accessMode = sanitizeText(task.accessMode).toLowerCase()
+    || getAccessModeForScope(task.sessionScopeKey);
   const session = (run && run.session)
     || getScopedSession(task.sessionScopeKey, task.workdir, backend);
   const sessionKey = sessionIdentityForTask({ ...task, backend });
@@ -3811,12 +3886,12 @@ async function executeTask(task, run) {
   try {
     const includePolicy = !(session.hasConversation && session.threadId);
     const prompt = task.kind === 'approval'
-      ? buildApprovalPrompt(task.action, pendingApprovalForSession, { includePolicy })
-      : buildUserPrompt(task.input, { includePolicy, backend });
+      ? buildApprovalPrompt(task.action, pendingApprovalForSession, { includePolicy, accessMode })
+      : buildUserPrompt(task.input, { includePolicy, backend, accessMode });
 
     const reply = backend === 'claude'
-      ? await runClaudeExec(prompt, session, task.workdir, task.context, run)
-      : await runCodexExec(prompt, session, task.workdir, task.context, run);
+      ? await runClaudeExec(prompt, session, task.workdir, task.context, run, accessMode)
+      : await runCodexExec(prompt, session, task.workdir, task.context, run, accessMode);
     if (!reply) {
       return;
     }
@@ -3830,7 +3905,8 @@ async function executeTask(task, run) {
         context: task.context,
         workdir: task.workdir,
         sessionScopeKey: task.sessionScopeKey,
-        backend
+        backend,
+        accessMode
       });
       const approvalMessage = [
         '检测到需要审批的操作：',
@@ -3982,7 +4058,9 @@ async function enqueueMessage(eventType, message, source = {}) {
       context,
       workdir: scopedApproval.workdir,
       sessionScopeKey: scopedApproval.sessionScopeKey,
-      backend: scopedApproval.backend || 'codex'
+      backend: scopedApproval.backend || 'codex',
+      accessMode: scopedApproval.accessMode
+        || getAccessModeForScope(scopedApproval.sessionScopeKey)
     };
     const approvalSessionKey = sessionIdentityForTask(approvalTask);
     enqueueToSessionQueue(approvalSessionKey, approvalTask, { priority: true });
@@ -4010,9 +4088,10 @@ async function enqueueMessage(eventType, message, source = {}) {
     action: null,
     input,
     context,
-    workdir: runnerState.workdir,
+    workdir: getWorkdirForScope(context.sessionScopeKey),
     sessionScopeKey: context.sessionScopeKey,
-    backend: getActiveBackend(context.sessionScopeKey)
+    backend: getActiveBackend(context.sessionScopeKey),
+    accessMode: getAccessModeForScope(context.sessionScopeKey)
   };
   const taskSessionKey = sessionIdentityForTask(task);
   const depthBefore = queueDepthForSession(taskSessionKey);
@@ -4028,8 +4107,20 @@ async function enqueueMessage(eventType, message, source = {}) {
 }
 
 async function startRunner() {
+  if (forceAccessMode) {
+    if (!VALID_ACCESS_MODES.has(forceAccessMode)) {
+      process.stderr.write(
+        `Invalid --force-access value: ${forceAccessMode}. Expected one of: read / write / safe / full\n`
+      );
+      process.exit(1);
+    }
+    runnerState.accessMode = forceAccessMode;
+    runnerState.accessModes = {};
+    persistRunnerState();
+    log(`Forcing every session to access mode: ${forceAccessMode} (per-scope overrides cleared).`);
+  }
+
   const qqConfigs = loadQQBotConfigs();
-  migrateLegacyQQSessions(qqConfigs);
 
   for (const config of qqConfigs) {
     const client = createQQBotClientFromConfig(config);
