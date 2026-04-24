@@ -1366,10 +1366,21 @@ function extractClaudeErrorFromEvents(events) {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
     if (!event || sanitizeText(event.type) !== 'result') continue;
-    if (!event.is_error && sanitizeText(event.subtype) !== 'error') continue;
-    return sanitizeText(event.result || event.error || event.message) || 'Claude 返回错误但未提供详细信息';
+    const subtype = sanitizeText(event.subtype);
+    if (!event.is_error && subtype !== 'error' && !subtype.startsWith('error')) continue;
+    if (Array.isArray(event.errors) && event.errors.length > 0) {
+      const combined = event.errors.map((entry) => sanitizeText(entry)).filter(Boolean).join('; ');
+      if (combined) return combined;
+    }
+    const direct = sanitizeText(event.result || event.error || event.message);
+    if (direct) return direct;
+    return 'Claude 返回错误但未提供详细信息';
   }
   return '';
+}
+
+function isClaudeSessionNotFoundError(message) {
+  return /no\s+conversation\s+found/i.test(String(message || ''));
 }
 
 function extractTokenUsageFromClaudeEvents(events) {
@@ -3545,7 +3556,36 @@ function summarizeClaudeFailure(stderr, stdout, events) {
   return combined.split('\n').slice(-12).join('\n');
 }
 
-function runClaudeExec(prompt, session, workdir, context, run, accessMode) {
+async function runClaudeExec(prompt, session, workdir, context, run, accessMode) {
+  try {
+    return await runClaudeExecOnce(prompt, session, workdir, context, run, accessMode);
+  } catch (error) {
+    const message = String(error && error.message ? error.message : error);
+    if (
+      session &&
+      session.hasConversation &&
+      session.threadId &&
+      isClaudeSessionNotFoundError(message)
+    ) {
+      log(
+        `Claude session ${session.threadId} not found on this machine; resetting and retrying as a new session.`
+      );
+      session.threadId = null;
+      session.hasConversation = false;
+      session.lastTokenUsage = null;
+      bumpSessionGeneration(session);
+      persistRunnerState();
+      await safeSendReply(
+        context,
+        '原 session 在本机找不到（可能换了机器或 session 被清），已自动新开一次会话并重试。'
+      ).catch(() => {});
+      return runClaudeExecOnce(prompt, session, workdir, context, run, accessMode);
+    }
+    throw error;
+  }
+}
+
+function runClaudeExecOnce(prompt, session, workdir, context, run, accessMode) {
   return new Promise((resolve, reject) => {
     const generation = session.generation;
     const args = buildClaudeArgs(prompt, session, workdir, accessMode);
