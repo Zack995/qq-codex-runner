@@ -9,440 +9,77 @@ const os = require('os');
 const path = require('path');
 const WebSocket = require('ws');
 
-function loadDotEnv(filename = '.env') {
-  const envPath = path.resolve(process.cwd(), filename);
-  let content = '';
-  try {
-    content = fs.readFileSync(envPath, 'utf8');
-  } catch (error) {
-    if (error && error.code === 'ENOENT') return;
-    throw error;
-  }
+const {
+  loadDotEnv,
+  parseBoolean,
+  requireEnv,
+  sanitizeText,
+  parseList,
+  expandHomeDir,
+  resolveInputPath,
+  stripAtMentions,
+  splitMessage,
+  log,
+  parsePositiveInteger,
+  getPositiveIntegerEnv,
+  escapeRegExp,
+  readTopLevelTomlValue,
+  nextMsgSeq,
+  requestJson,
+  requestJsonWithTimeout,
+  sleep,
+  requestTextWithTimeout,
+  normalizeTokenUsage,
+  addTokenUsage,
+  formatTokenNumber,
+  formatTokenUsage,
+  compactWhitespace
+} = require('./src/util');
 
-  for (const rawLine of content.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith('#')) continue;
+loadDotEnv();
 
-    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
-    if (!match) continue;
+const {
+  usage,
+  parseArgs,
+  INTENT_FLAGS,
+  parseIntents,
+  intentsToBitmask,
+  prepareCodexHome,
+  VALID_ACCESS_MODES,
+  VALID_BACKENDS,
+  BACKEND_LABELS,
+  CLAUDE_PERMISSION_MODE_BY_ACCESS,
+  MAX_BOT_MESSAGE_LENGTH,
+  PROGRESS_HEARTBEAT_INTERVAL_MS,
+  BACKEND_PROBE_TIMEOUT_MS,
+  MAX_WORKDIR_SEARCH_RESULTS,
+  MAX_WORKDIR_SEARCH_DIRS,
+  WORKDIR_SYSTEM_SEARCH_TIMEOUT_MS,
+  WORKDIR_SYSTEM_SEARCH_MAX_BUFFER,
+  PERSIST_DEBOUNCE_MS,
+  WORKDIR_SEARCH_SKIP_NAMES,
+  loadRuntimeConfig
+} = require('./src/config');
 
-    const key = match[1];
-    let value = match[2];
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
-    value = value.replace(/\\n/g, '\n').replace(/\\r/g, '\r');
+const {
+  EXEC_TIMEOUT_MS,
+  EXEC_TIMEOUT_DISABLED,
+  MAX_CONCURRENCY,
+  PRIMARY_CODEX_HOME,
+  RUNNER_CODEX_HOME,
+  CODEX_CONTEXT_WINDOW_OVERRIDE,
+  CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE,
+  CLAUDE_BIN,
+  RUNNER_CLAUDE_HOME,
+  DEFAULT_BACKEND,
+  DEFAULT_WORKDIR,
+  DEFAULT_ADD_DIRS,
+  WEIXIN_ENABLED,
+  WEIXIN_ACCOUNT_ID,
+  RUNNER_STATE_FILE
+} = loadRuntimeConfig();
 
-    if (typeof process.env[key] === 'undefined') {
-      process.env[key] = value;
-    }
-  }
-}
-
-function usage(exitCode = 1) {
-  const message = [
-    'Usage:',
-    '  qq-codex-runner [--cmd <codex-bin>] [--full | --force-access <mode>] -- <codex args...>',
-    '  qq-codex-runner --weixin-login [--weixin-account <id>] [--weixin-name <alias>] [--weixin-login-force]',
-    '  qq-codex-runner --weixin-logout [--weixin-account <id>]',
-    '  qq-codex-runner --help',
-    '',
-    'Options:',
-    '  --full               Boot with every session forced to access-mode=full',
-    '                       (clears any per-scope /access overrides; equivalent to',
-    '                        --force-access full)',
-    '  --force-access <m>   Same as --full, but with a chosen mode (read|write|safe|full)'
-  ].join('\n');
-  process.stderr.write(`${message}\n`);
-  process.exit(exitCode);
-}
-
-function parseBoolean(value, defaultValue) {
-  if (typeof value !== 'string' || value.length === 0) return defaultValue;
-  return ['1', 'true', 'yes', 'on'].includes(value.toLowerCase());
-}
-
-function requireEnv(name) {
-  const value = process.env[name];
-  if (typeof value === 'string' && value.length > 0) return value;
-  process.stderr.write(`Missing required environment variable: ${name}\n`);
-  process.exit(1);
-}
-
-function sanitizeText(text) {
-  return String(text || '')
-    .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
-    .replace(/\u0000/g, '')
-    .trim();
-}
-
-function parseList(value) {
-  if (typeof value !== 'string' || !value.trim()) return [];
-  return value
-    .split(',')
-    .map((item) => sanitizeText(item))
-    .filter(Boolean);
-}
-
-function expandHomeDir(value) {
-  const normalized = sanitizeText(value);
-  if (!normalized) return normalized;
-  if (normalized === '~') return os.homedir();
-  if (normalized.startsWith(`~${path.sep}`)) {
-    return path.join(os.homedir(), normalized.slice(2));
-  }
-  return normalized;
-}
-
-function resolveInputPath(value) {
-  return path.resolve(expandHomeDir(value));
-}
-
-function stripAtMentions(text) {
-  return String(text || '').replace(/<@!?\d+>/g, ' ').replace(/\s+/g, ' ').trim();
-}
-
-function splitMessage(text, maxLength) {
-  const normalized = sanitizeText(text);
-  if (!normalized) return [];
-
-  const chunks = [];
-  let rest = normalized;
-  while (rest.length > maxLength) {
-    let cut = rest.lastIndexOf('\n', maxLength);
-    if (cut < maxLength * 0.4) {
-      cut = rest.lastIndexOf(' ', maxLength);
-    }
-    if (cut < maxLength * 0.4) {
-      cut = maxLength;
-    }
-    chunks.push(rest.slice(0, cut).trim());
-    rest = rest.slice(cut).trim();
-  }
-  if (rest) chunks.push(rest);
-  return chunks.filter(Boolean);
-}
-
-function log(message) {
-  process.stderr.write(`[qq-codex-runner] ${message}\n`);
-}
-
-function parsePositiveInteger(value) {
-  const normalized = sanitizeText(value);
-  if (!normalized) return null;
-  const parsed = Number(normalized);
-  if (!Number.isFinite(parsed) || parsed <= 0) return null;
-  return Math.floor(parsed);
-}
-
-function getPositiveIntegerEnv(name) {
-  const rawValue = sanitizeText(process.env[name]);
-  if (!rawValue) return null;
-
-  const parsed = parsePositiveInteger(rawValue);
-  if (parsed === null) {
-    log(`Ignoring invalid ${name}: ${rawValue}`);
-    return null;
-  }
-
-  return parsed;
-}
-
-function escapeRegExp(text) {
-  return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function readTopLevelTomlValue(filePath, key) {
-  if (!filePath || !key) return null;
-
-  let content = '';
-  try {
-    content = fs.readFileSync(filePath, 'utf8');
-  } catch (_) {
-    return null;
-  }
-
-  const match = content.match(new RegExp(`^${escapeRegExp(key)}\\s*=\\s*(.+)$`, 'm'));
-  if (!match) return null;
-
-  const withoutComment = match[1].replace(/\s+#.*$/, '').trim();
-  if (!withoutComment) return null;
-
-  if (
-    (withoutComment.startsWith('"') && withoutComment.endsWith('"')) ||
-    (withoutComment.startsWith("'") && withoutComment.endsWith("'"))
-  ) {
-    return withoutComment.slice(1, -1);
-  }
-
-  if (/^-?\d+$/.test(withoutComment)) {
-    return Number(withoutComment);
-  }
-
-  if (/^(true|false)$/i.test(withoutComment)) {
-    return withoutComment.toLowerCase() === 'true';
-  }
-
-  return withoutComment;
-}
-
-function nextMsgSeq() {
-  return Math.floor(Math.random() * 65535) + 1;
-}
-
-function requestJson(method, urlString, headers = {}, body) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(urlString);
-    const payload = body ? JSON.stringify(body) : null;
-
-    const req = https.request(
-      {
-        protocol: url.protocol,
-        hostname: url.hostname,
-        port: url.port || undefined,
-        path: `${url.pathname}${url.search}`,
-        method,
-        headers: {
-          Accept: 'application/json',
-          'User-Agent': 'qq-codex-runner',
-          ...(payload
-            ? {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(payload)
-              }
-            : {}),
-          ...headers
-        }
-      },
-      (res) => {
-        let data = '';
-        res.setEncoding('utf8');
-        res.on('data', (chunk) => {
-          data += chunk;
-        });
-        res.on('end', () => {
-          let parsed = null;
-          try {
-            parsed = data ? JSON.parse(data) : null;
-          } catch (_) {
-            parsed = data;
-          }
-
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            resolve(parsed);
-            return;
-          }
-
-          const error = new Error(
-            `HTTP ${res.statusCode} ${res.statusMessage || ''}: ${
-              parsed && parsed.message
-                ? parsed.message
-                : typeof parsed === 'string'
-                  ? parsed
-                  : 'request failed'
-            }`
-          );
-          error.statusCode = res.statusCode;
-          error.responseBody = parsed;
-          reject(error);
-        });
-      }
-    );
-
-    req.on('error', reject);
-    if (payload) req.write(payload);
-    req.end();
-  });
-}
-
-function requestJsonWithTimeout(method, urlString, headers = {}, body, options = {}) {
-  const timeoutMs = Number(options.timeoutMs || 0);
-  return new Promise(async (resolve, reject) => {
-    const payload = body ? JSON.stringify(body) : null;
-    const controller = new AbortController();
-    const signals = [controller.signal];
-    if (options.signal) {
-      signals.push(options.signal);
-    }
-    const signal = signals.length > 1 ? AbortSignal.any(signals) : controller.signal;
-    const timer = timeoutMs > 0
-      ? setTimeout(() => controller.abort(), timeoutMs)
-      : null;
-
-    try {
-      const response = await fetch(urlString, {
-        method,
-        headers: {
-          Accept: 'application/json',
-          ...(payload
-            ? {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(payload).toString()
-              }
-            : {}),
-          ...headers
-        },
-        body: payload,
-        signal
-      });
-
-      const text = await response.text();
-      let parsed = null;
-      try {
-        parsed = text ? JSON.parse(text) : null;
-      } catch (_) {
-        parsed = text;
-      }
-
-      if (response.status >= 200 && response.status < 300) {
-        resolve(parsed);
-        return;
-      }
-
-      const error = new Error(
-        `HTTP ${response.status} ${response.statusText || ''}: ${
-          parsed && parsed.message
-            ? parsed.message
-            : typeof parsed === 'string'
-              ? parsed
-              : 'request failed'
-        }`
-      );
-      error.statusCode = response.status;
-      error.responseBody = parsed;
-      reject(error);
-    } catch (error) {
-      reject(error);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  });
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
-
-const CODEX_HOME_TEMPLATE_ITEMS = [
-  'auth.json',
-  'config.toml',
-  'AGENTS.md',
-  'rules',
-  'skills',
-  'vendor_imports'
-];
-
-function copyCodexHomeTemplate(sourceRoot, targetRoot) {
-  if (!sourceRoot || !targetRoot) return;
-  if (sourceRoot === targetRoot) return;
-  if (!fs.existsSync(sourceRoot)) return;
-
-  let sourceStat;
-  try {
-    sourceStat = fs.statSync(sourceRoot);
-  } catch (_) {
-    return;
-  }
-  if (!sourceStat.isDirectory()) return;
-
-  for (const relativePath of CODEX_HOME_TEMPLATE_ITEMS) {
-    const sourcePath = path.join(sourceRoot, relativePath);
-    const targetPath = path.join(targetRoot, relativePath);
-    if (!fs.existsSync(sourcePath) || fs.existsSync(targetPath)) continue;
-
-    fs.cpSync(sourcePath, targetPath, {
-      recursive: true,
-      force: false,
-      errorOnExist: false
-    });
-    log(`Copied Codex config asset: ${relativePath}`);
-  }
-}
-
-function prepareCodexHome(rawPath, sourcePath) {
-  const normalized = sanitizeText(rawPath);
-  if (!normalized) return '';
-
-  const resolved = resolveInputPath(normalized);
-  fs.mkdirSync(resolved, { recursive: true });
-  copyCodexHomeTemplate(
-    sanitizeText(sourcePath) ? resolveInputPath(sourcePath) : '',
-    resolved
-  );
-
-  const stat = fs.statSync(resolved);
-  if (!stat.isDirectory()) {
-    throw new Error(`RUNNER_CODEX_HOME is not a directory: ${resolved}`);
-  }
-
-  return resolved;
-}
-
-async function requestTextWithTimeout(urlString, options = {}) {
-  const timeoutMs = Number(options.timeoutMs || 0);
-  const headers = options.headers || {};
-  const controller = new AbortController();
-  const signals = [controller.signal];
-  if (options.signal) {
-    signals.push(options.signal);
-  }
-  const signal = signals.length > 1 ? AbortSignal.any(signals) : controller.signal;
-  const timer = timeoutMs > 0
-    ? setTimeout(() => controller.abort(), timeoutMs)
-    : null;
-
-  try {
-    const response = await fetch(urlString, {
-      method: options.method || 'GET',
-      headers,
-      signal
-    });
-    const text = await response.text();
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status} ${response.statusText || ''}: ${text}`);
-    }
-    return text;
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-const INTENT_FLAGS = {
-  GUILDS: 1 << 0,
-  GUILD_MEMBERS: 1 << 1,
-  GUILD_MESSAGES: 1 << 9,
-  GUILD_MESSAGE_REACTIONS: 1 << 10,
-  GROUP_AND_C2C: 1 << 25,
-  INTERACTION: 1 << 26,
-  MESSAGE_AUDIT: 1 << 27,
-  FORUMS_EVENT: 1 << 28,
-  AUDIO_ACTION: 1 << 29,
-  PUBLIC_GUILD_MESSAGES: 1 << 30
-};
-
-function parseIntents(value) {
-  const defaults = ['PUBLIC_GUILD_MESSAGES', 'GROUP_AND_C2C'];
-  const intents = typeof value === 'string' && value.trim()
-    ? value.split(',').map((item) => item.trim()).filter(Boolean)
-    : defaults;
-
-  const invalid = intents.filter((item) => !(item in INTENT_FLAGS));
-  if (invalid.length > 0) {
-    process.stderr.write(`Invalid QQ_BOT_INTENTS values: ${invalid.join(', ')}\n`);
-    process.exit(1);
-  }
-  return intents;
-}
-
-function intentsToBitmask(intents) {
-  return intents.reduce((sum, name) => sum | INTENT_FLAGS[name], 0);
-}
+let persistDebounceTimer = null;
 
 class QQBotClient {
   constructor(config) {
@@ -951,70 +588,6 @@ class WeixinClient {
   }
 }
 
-function parseArgs(argv) {
-  const delimiterIndex = argv.indexOf('--');
-  const runnerArgs = delimiterIndex === -1 ? argv : argv.slice(0, delimiterIndex);
-  const codexArgs = delimiterIndex === -1 ? [] : argv.slice(delimiterIndex + 1);
-  let command = process.env.CODEX_BIN || 'codex';
-  let mode = 'runner';
-  let weixinAccountId = sanitizeText(process.env.WEIXIN_ACCOUNT_ID || 'default') || 'default';
-  let weixinLoginForce = false;
-  let weixinName = '';
-  let forceAccessMode = '';
-
-  for (let index = 0; index < runnerArgs.length; index += 1) {
-    const token = runnerArgs[index];
-    if (token === '-h' || token === '--help') usage(0);
-    if (token === '--weixin-login') {
-      mode = 'weixin-login';
-      continue;
-    }
-    if (token === '--weixin-logout') {
-      mode = 'weixin-logout';
-      continue;
-    }
-    if (token === '--weixin-login-force') {
-      weixinLoginForce = true;
-      continue;
-    }
-    if (token === '--weixin-account') {
-      const next = runnerArgs[index + 1];
-      if (!next) usage(1);
-      weixinAccountId = sanitizeText(next) || weixinAccountId;
-      index += 1;
-      continue;
-    }
-    if (token === '--weixin-name') {
-      const next = runnerArgs[index + 1];
-      if (!next) usage(1);
-      weixinName = sanitizeText(next);
-      index += 1;
-      continue;
-    }
-    if (token === '--cmd') {
-      const next = runnerArgs[index + 1];
-      if (!next) usage(1);
-      command = next;
-      index += 1;
-      continue;
-    }
-    if (token === '--full') {
-      forceAccessMode = 'full';
-      continue;
-    }
-    if (token === '--force-access') {
-      const next = runnerArgs[index + 1];
-      if (!next) usage(1);
-      forceAccessMode = sanitizeText(next).toLowerCase();
-      index += 1;
-      continue;
-    }
-    usage(1);
-  }
-
-  return { command, codexArgs, mode, weixinAccountId, weixinLoginForce, weixinName, forceAccessMode };
-}
-
 function parseExecJsonEvents(output) {
   const lines = String(output || '')
     .split(/\r?\n/)
@@ -1037,59 +610,6 @@ function parseExecJsonEventLine(line) {
   } catch (_) {
     return null;
   }
-}
-
-function normalizeTokenUsage(value) {
-  if (!value || typeof value !== 'object') return null;
-
-  const inputTokens = Math.max(0, Number(value.input_tokens ?? value.inputTokens ?? 0) || 0);
-  const cachedInputTokens = Math.max(
-    0,
-    Number(value.cached_input_tokens ?? value.cachedInputTokens ?? 0) || 0
-  );
-  const outputTokens = Math.max(0, Number(value.output_tokens ?? value.outputTokens ?? 0) || 0);
-  const reasoningOutputTokens = Math.max(
-    0,
-    Number(value.reasoning_output_tokens ?? value.reasoningOutputTokens ?? 0) || 0
-  );
-  const totalTokens = Math.max(
-    0,
-    Number(value.total_tokens ?? value.totalTokens ?? (inputTokens + outputTokens + reasoningOutputTokens)) || 0
-  );
-
-  if (
-    inputTokens === 0 &&
-    cachedInputTokens === 0 &&
-    outputTokens === 0 &&
-    reasoningOutputTokens === 0 &&
-    totalTokens === 0
-  ) {
-    return null;
-  }
-
-  return {
-    inputTokens,
-    cachedInputTokens,
-    outputTokens,
-    reasoningOutputTokens,
-    totalTokens
-  };
-}
-
-function addTokenUsage(left, right) {
-  const normalizedLeft = normalizeTokenUsage(left);
-  const normalizedRight = normalizeTokenUsage(right);
-  if (!normalizedLeft && !normalizedRight) return null;
-  if (!normalizedLeft) return normalizedRight;
-  if (!normalizedRight) return normalizedLeft;
-
-  return {
-    inputTokens: normalizedLeft.inputTokens + normalizedRight.inputTokens,
-    cachedInputTokens: normalizedLeft.cachedInputTokens + normalizedRight.cachedInputTokens,
-    outputTokens: normalizedLeft.outputTokens + normalizedRight.outputTokens,
-    reasoningOutputTokens: normalizedLeft.reasoningOutputTokens + normalizedRight.reasoningOutputTokens,
-    totalTokens: normalizedLeft.totalTokens + normalizedRight.totalTokens
-  };
 }
 
 function extractTokenUsageFromExecEvents(events) {
@@ -1142,32 +662,6 @@ function summarizeExecFailure(stderr, stdout) {
   const combined = sanitizeText([stderr, stdout].filter(Boolean).join('\n'));
   if (!combined) return 'Codex did not return readable output.';
   return combined.split('\n').slice(-12).join('\n');
-}
-
-function formatTokenNumber(value) {
-  return Number(value || 0).toLocaleString('en-US');
-}
-
-function formatTokenUsage(usage) {
-  const normalized = normalizeTokenUsage(usage);
-  if (!normalized) return '暂无';
-
-  const parts = [
-    `输入 ${formatTokenNumber(normalized.inputTokens)}`
-  ];
-  if (normalized.cachedInputTokens > 0) {
-    parts[0] += `（缓存 ${formatTokenNumber(normalized.cachedInputTokens)}）`;
-  }
-  parts.push(`输出 ${formatTokenNumber(normalized.outputTokens)}`);
-  if (normalized.reasoningOutputTokens > 0) {
-    parts.push(`推理 ${formatTokenNumber(normalized.reasoningOutputTokens)}`);
-  }
-  parts.push(`合计 ${formatTokenNumber(normalized.totalTokens)}`);
-  return parts.join('，');
-}
-
-function compactWhitespace(text) {
-  return String(text || '').replace(/\s+/g, ' ').trim();
 }
 
 function summarizeCommandForProgress(commandText) {
@@ -1878,67 +1372,6 @@ loadDotEnv();
 
 const { command, codexArgs, mode, weixinAccountId, weixinLoginForce, weixinName, forceAccessMode } = parseArgs(process.argv.slice(2));
 const qqBots = new Map();
-const WEIXIN_ENABLED = parseBoolean(process.env.WEIXIN_ENABLED, true);
-
-const MAX_BOT_MESSAGE_LENGTH = 1500;
-const PROGRESS_HEARTBEAT_INTERVAL_MS = 25 * 1000;
-const DEFAULT_EXEC_TIMEOUT_MS = 30 * 60 * 1000;
-const RAW_EXEC_TIMEOUT_MS = Number(process.env.CODEX_EXEC_TIMEOUT_MS);
-const EXEC_TIMEOUT_MS = Number.isFinite(RAW_EXEC_TIMEOUT_MS)
-  ? RAW_EXEC_TIMEOUT_MS
-  : DEFAULT_EXEC_TIMEOUT_MS;
-const EXEC_TIMEOUT_DISABLED = EXEC_TIMEOUT_MS <= 0;
-const MAX_WORKDIR_SEARCH_RESULTS = 5;
-const MAX_WORKDIR_SEARCH_DIRS = 2500;
-const WORKDIR_SYSTEM_SEARCH_TIMEOUT_MS = 3000;
-const WORKDIR_SYSTEM_SEARCH_MAX_BUFFER = 512 * 1024;
-const RUNNER_STATE_FILE = path.resolve(process.cwd(), 'logs', 'runner-state.json');
-const PRIMARY_CODEX_HOME = sanitizeText(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'));
-const RUNNER_CODEX_HOME = prepareCodexHome(
-  process.env.RUNNER_CODEX_HOME || process.env.CODEX_HOME || '',
-  PRIMARY_CODEX_HOME
-);
-const CODEX_CONTEXT_WINDOW_OVERRIDE = getPositiveIntegerEnv('CODEX_CONTEXT_WINDOW');
-const CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE = getPositiveIntegerEnv('CODEX_AUTO_COMPACT_TOKEN_LIMIT');
-const WORKDIR_SEARCH_SKIP_NAMES = new Set([
-  '.git',
-  '.next',
-  '.nuxt',
-  '.svn',
-  '.Trash',
-  '.yarn',
-  'Applications',
-  'Library',
-  'System',
-  'Volumes',
-  'node_modules'
-]);
-const DEFAULT_WORKDIR = resolveInputPath(process.env.RUNNER_WORKDIR || process.cwd());
-const DEFAULT_ADD_DIRS = parseList(process.env.RUNNER_ADD_DIRS).map((item) => resolveInputPath(item));
-const VALID_ACCESS_MODES = new Map([
-  ['read', { label: '只读', sandbox: 'read-only', bypass: false }],
-  ['write', { label: '工作区可写', sandbox: 'workspace-write', bypass: false }],
-  ['safe', { label: '安全模式', sandbox: 'workspace-write', bypass: false }],
-  ['full', { label: '完全访问', sandbox: 'danger-full-access', bypass: true }]
-]);
-const VALID_BACKENDS = new Set(['codex', 'claude']);
-const BACKEND_LABELS = { codex: 'Codex', claude: 'Claude Code' };
-const DEFAULT_BACKEND = (() => {
-  const raw = sanitizeText(process.env.RUNNER_DEFAULT_BACKEND).toLowerCase();
-  return VALID_BACKENDS.has(raw) ? raw : 'claude';
-})();
-const CLAUDE_BIN = sanitizeText(process.env.CLAUDE_BIN) || 'claude';
-const RUNNER_CLAUDE_HOME = (() => {
-  const raw = sanitizeText(process.env.RUNNER_CLAUDE_HOME || '');
-  return raw ? resolveInputPath(raw) : '';
-})();
-const CLAUDE_PERMISSION_MODE_BY_ACCESS = {
-  read: 'plan',
-  write: 'acceptEdits',
-  safe: 'acceptEdits',
-  full: 'bypassPermissions'
-};
-const BACKEND_PROBE_TIMEOUT_MS = 5000;
 const persistedRunnerState = loadPersistedRunnerState();
 const initialRunnerState = deriveInitialRunnerState(persistedRunnerState);
 
@@ -1946,12 +1379,6 @@ const sessionQueues = new Map();    // sessionKey -> task[]
 const activeRuns = new Map();       // sessionKey -> { task, session, child, generation, backend }
 const pendingApprovals = new Map(); // sessionKey -> approval record
 const codexSessions = new Map();
-const DEFAULT_MAX_CONCURRENCY = 3;
-const RAW_MAX_CONCURRENCY = Number(process.env.RUNNER_MAX_CONCURRENCY);
-const MAX_CONCURRENCY =
-  Number.isFinite(RAW_MAX_CONCURRENCY) && RAW_MAX_CONCURRENCY > 0
-    ? Math.floor(RAW_MAX_CONCURRENCY)
-    : DEFAULT_MAX_CONCURRENCY;
 let runnerState = {
   workdir: initialRunnerState.workdir,
   workdirs: { ...(initialRunnerState.workdirs || {}) },
@@ -2048,7 +1475,6 @@ function getCodexAutoCompactStatus() {
   }
   return '已启用';
 }
-const WEIXIN_ACCOUNT_ID = sanitizeText(process.env.WEIXIN_ACCOUNT_ID || 'default') || 'default';
 
 if (!VALID_ACCESS_MODES.has(runnerState.accessMode)) {
   runnerState.accessMode = 'safe';
@@ -2263,7 +1689,7 @@ function setStoredWeixinAccount(account) {
     userId: sanitizeText(account && account.userId)
   };
   weixinState.defaultAccountId = normalizedAccountId;
-  persistRunnerState();
+  persistRunnerStateNow();
 }
 
 function clearStoredWeixinAccount(accountId) {
@@ -2288,7 +1714,7 @@ function clearStoredWeixinAccount(accountId) {
     const remainingAccountId = Object.keys(weixinState.accounts)[0];
     weixinState.defaultAccountId = remainingAccountId || 'default';
   }
-  persistRunnerState();
+  persistRunnerStateNow();
 }
 
 function resolveWeixinRuntimeAccount(accountId) {
@@ -2646,7 +2072,11 @@ function buildPersistedRunnerState() {
   };
 }
 
-function persistRunnerState() {
+function persistRunnerStateNow() {
+  if (persistDebounceTimer) {
+    clearTimeout(persistDebounceTimer);
+    persistDebounceTimer = null;
+  }
   const payload = JSON.stringify(buildPersistedRunnerState(), null, 2);
   const tempFile = `${RUNNER_STATE_FILE}.tmp`;
 
@@ -2660,6 +2090,14 @@ function persistRunnerState() {
     } catch (_) {}
     log(`Failed to persist runner state: ${error && error.message ? error.message : String(error)}`);
   }
+}
+
+function persistRunnerState() {
+  if (persistDebounceTimer) return;
+  persistDebounceTimer = setTimeout(() => {
+    persistDebounceTimer = null;
+    persistRunnerStateNow();
+  }, PERSIST_DEBOUNCE_MS);
 }
 
 function bumpSessionGeneration(session) {
@@ -3370,21 +2808,39 @@ function buildCodexArgs(prompt, outputFile, session, workdir, accessMode) {
   return args;
 }
 
-function runCodexExec(prompt, session, workdir, context, run, accessMode) {
+function runAgentChildProcess(options) {
+  const {
+    bin,
+    args,
+    cwd,
+    env,
+    session,
+    run,
+    context,
+    parseEvent,
+    timeoutLabel,
+    spawnErrorMapper,
+    onSuccess
+  } = options;
+
   return new Promise((resolve, reject) => {
     const generation = session.generation;
-    const outputFile = path.join(os.tmpdir(), `qq-codex-runner-last-${process.pid}-${Date.now()}.txt`);
-    const args = buildCodexArgs(prompt, outputFile, session, workdir, accessMode);
-    const progressReporter = createProgressReporter(context);
-    const child = childProcess.spawn(command, args, {
-      cwd: workdir,
-      env: {
-        ...process.env,
-        TERM: process.env.TERM || 'xterm-256color',
-        ...(RUNNER_CODEX_HOME ? { CODEX_HOME: RUNNER_CODEX_HOME } : {})
-      },
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
+    const progressReporter = createProgressReporter(context, parseEvent);
+
+    let child;
+    try {
+      child = childProcess.spawn(bin, args, {
+        cwd,
+        env,
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+    } catch (error) {
+      void progressReporter.stop().then(() => {
+        const mapped = spawnErrorMapper ? spawnErrorMapper(error) : null;
+        reject(mapped || error);
+      });
+      return;
+    }
 
     if (run) run.child = child;
 
@@ -3406,24 +2862,18 @@ function runCodexExec(prompt, session, workdir, context, run, accessMode) {
       timeout = setTimeout(() => {
         if (settled) return;
         settled = true;
-        try {
-          child.kill('SIGTERM');
-        } catch (_) {}
+        try { child.kill('SIGTERM'); } catch (_) {}
         if (run) run.child = null;
-        if (generation !== session.generation) {
-          void progressReporter.stop().then(() => {
-            resolve(null);
-          });
-          return;
-        }
         void progressReporter.stop().then(() => {
-          reject(
-            new Error(
-              `Codex execution timed out after ${Math.floor(
-                EXEC_TIMEOUT_MS / 1000
-              )} seconds without new output. You can increase CODEX_EXEC_TIMEOUT_MS or set it to 0 to disable this timeout.`
-            )
-          );
+          if (generation !== session.generation) {
+            resolve(null);
+            return;
+          }
+          reject(new Error(
+            `${timeoutLabel} execution timed out after ${Math.floor(
+              EXEC_TIMEOUT_MS / 1000
+            )} seconds without new output. You can increase CODEX_EXEC_TIMEOUT_MS or set it to 0 to disable this timeout.`
+          ));
         });
       }, EXEC_TIMEOUT_MS);
     };
@@ -3464,7 +2914,8 @@ function runCodexExec(prompt, session, workdir, context, run, accessMode) {
           resolve(null);
           return;
         }
-        reject(error);
+        const mapped = spawnErrorMapper ? spawnErrorMapper(error) : null;
+        reject(mapped || error);
       })();
     });
 
@@ -3477,64 +2928,87 @@ function runCodexExec(prompt, session, workdir, context, run, accessMode) {
         handleStdoutEvent(parseExecJsonEventLine(stdoutBuffer));
         await progressReporter.stop();
 
-        let finalMessage = '';
-        try {
-          finalMessage = fs.readFileSync(outputFile, 'utf8');
-        } catch (_) {}
-        try {
-          fs.unlinkSync(outputFile);
-        } catch (_) {}
-
         if (generation !== session.generation) {
           resolve(null);
           return;
         }
 
         if (signal) {
-          reject(new Error(`Codex process exited with signal ${signal}.`));
-          return;
-        }
-
-        if (code !== 0) {
-          const hint = describeBackendRuntimeError('codex', stderr, stdout);
-          reject(new Error(summarizeExecFailure(stderr, stdout) + hint));
+          reject(new Error(`${timeoutLabel} process exited with signal ${signal}.`));
           return;
         }
 
         const events = parseExecJsonEvents(stdout);
-        const threadId = extractThreadIdFromExecEvents(events);
-        const tokenUsage = extractTokenUsageFromExecEvents(events);
-        if (threadId) {
-          session.threadId = threadId;
+        try {
+          const result = await onSuccess({ code, stdout, stderr, events });
+          if (result && result.error) {
+            reject(result.error);
+            return;
+          }
+          resolve(result && result.reply ? result.reply : null);
+        } catch (err) {
+          reject(err);
         }
-        if (tokenUsage.lastUsage) {
-          session.lastTokenUsage = tokenUsage.lastUsage;
-        }
-        if (tokenUsage.totalUsage) {
-          session.totalTokenUsage = tokenUsage.totalUsage;
-        } else if (tokenUsage.lastUsage) {
-          session.totalTokenUsage = addTokenUsage(session.totalTokenUsage, tokenUsage.lastUsage);
-        }
-        if (events.length > 0 || sanitizeText(finalMessage)) {
-          session.hasConversation = true;
-          persistRunnerState();
-        }
-
-        const normalized = sanitizeText(finalMessage);
-        if (!normalized) {
-          reject(new Error('Codex finished without a final reply.'));
-          return;
-        }
-
-        resolve(normalized);
       })();
     });
   });
 }
 
+function runCodexExec(prompt, session, workdir, context, run, accessMode) {
+  const outputFile = path.join(os.tmpdir(), `qq-codex-runner-last-${process.pid}-${Date.now()}.txt`);
+  const args = buildCodexArgs(prompt, outputFile, session, workdir, accessMode);
+  const env = { ...process.env, TERM: process.env.TERM || 'xterm-256color' };
+  if (RUNNER_CODEX_HOME) env.CODEX_HOME = RUNNER_CODEX_HOME;
+
+  return runAgentChildProcess({
+    bin: command,
+    args,
+    cwd: workdir,
+    env,
+    session,
+    run,
+    context,
+    parseEvent: extractProgressUpdateFromExecEvent,
+    timeoutLabel: 'Codex',
+    onSuccess: async ({ code, stdout, stderr, events }) => {
+      let finalMessage = '';
+      try { finalMessage = fs.readFileSync(outputFile, 'utf8'); } catch (_) {}
+      try { fs.unlinkSync(outputFile); } catch (_) {}
+
+      if (code !== 0) {
+        const hint = describeBackendRuntimeError('codex', stderr, stdout);
+        return { error: new Error(summarizeExecFailure(stderr, stdout) + hint) };
+      }
+
+      const threadId = extractThreadIdFromExecEvents(events);
+      const tokenUsage = extractTokenUsageFromExecEvents(events);
+      if (threadId) session.threadId = threadId;
+      if (tokenUsage.lastUsage) session.lastTokenUsage = tokenUsage.lastUsage;
+      if (tokenUsage.totalUsage) {
+        session.totalTokenUsage = tokenUsage.totalUsage;
+      } else if (tokenUsage.lastUsage) {
+        session.totalTokenUsage = addTokenUsage(session.totalTokenUsage, tokenUsage.lastUsage);
+      }
+      if (events.length > 0 || sanitizeText(finalMessage)) {
+        session.hasConversation = true;
+        persistRunnerState();
+      }
+
+      const normalized = sanitizeText(finalMessage);
+      if (!normalized) return { error: new Error('Codex finished without a final reply.') };
+      return { reply: normalized };
+    }
+  });
+}
+
 function buildClaudeArgs(prompt, session, workdir, accessMode) {
   void workdir;
-  const args = ['-p', '--output-format', 'stream-json', '--verbose'];
+  const args = [
+    '-p',
+    '--output-format', 'stream-json',
+    '--verbose',
+    '--include-partial-messages'
+  ];
   const mode = sanitizeText(accessMode).toLowerCase() || runnerState.accessMode;
   const permissionMode = CLAUDE_PERMISSION_MODE_BY_ACCESS[mode] || 'default';
   args.push('--permission-mode', permissionMode);
@@ -3586,185 +3060,62 @@ async function runClaudeExec(prompt, session, workdir, context, run, accessMode)
 }
 
 function runClaudeExecOnce(prompt, session, workdir, context, run, accessMode) {
-  return new Promise((resolve, reject) => {
-    const generation = session.generation;
-    const args = buildClaudeArgs(prompt, session, workdir, accessMode);
-    const progressReporter = createProgressReporter(context, extractProgressUpdateFromClaudeEvent);
+  const args = buildClaudeArgs(prompt, session, workdir, accessMode);
+  const env = { ...process.env, TERM: process.env.TERM || 'xterm-256color' };
+  if (RUNNER_CLAUDE_HOME) env.CLAUDE_CONFIG_DIR = RUNNER_CLAUDE_HOME;
 
-    const spawnEnv = {
-      ...process.env,
-      TERM: process.env.TERM || 'xterm-256color'
-    };
-    if (RUNNER_CLAUDE_HOME) {
-      spawnEnv.CLAUDE_CONFIG_DIR = RUNNER_CLAUDE_HOME;
+  const claudeSpawnErrorMapper = (error) => {
+    if (error && error.code === 'ENOENT') {
+      return new Error(
+        `未找到 claude 可执行文件：${CLAUDE_BIN}。请安装 Claude Code CLI 或设置 CLAUDE_BIN。`
+      );
     }
+    return null;
+  };
 
-    let child;
-    try {
-      child = childProcess.spawn(CLAUDE_BIN, args, {
-        cwd: workdir,
-        env: spawnEnv,
-        stdio: ['ignore', 'pipe', 'pipe']
-      });
-    } catch (error) {
-      void progressReporter.stop().then(() => {
-        if (error && error.code === 'ENOENT') {
-          reject(new Error(
-            `未找到 claude 可执行文件：${CLAUDE_BIN}。请安装 Claude Code CLI 或设置 CLAUDE_BIN。`
-          ));
-          return;
-        }
-        reject(error);
-      });
-      return;
-    }
+  return runAgentChildProcess({
+    bin: CLAUDE_BIN,
+    args,
+    cwd: workdir,
+    env,
+    session,
+    run,
+    context,
+    parseEvent: extractProgressUpdateFromClaudeEvent,
+    timeoutLabel: 'Claude',
+    spawnErrorMapper: claudeSpawnErrorMapper,
+    onSuccess: async ({ code, stdout, stderr, events }) => {
+      const sessionId = extractSessionIdFromClaudeEvents(events);
+      const tokenUsage = extractTokenUsageFromClaudeEvents(events);
+      const claudeError = extractClaudeErrorFromEvents(events);
+      const finalMessage = extractFinalMessageFromClaudeEvents(events);
 
-    if (run) run.child = child;
-
-    let stdout = '';
-    let stdoutBuffer = '';
-    let stderr = '';
-    let settled = false;
-    let timeout = null;
-
-    const clearExecTimeout = () => {
-      if (!timeout) return;
-      clearTimeout(timeout);
-      timeout = null;
-    };
-
-    const refreshExecTimeout = () => {
-      if (EXEC_TIMEOUT_DISABLED || settled) return;
-      clearExecTimeout();
-      timeout = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        try { child.kill('SIGTERM'); } catch (_) {}
-        if (run) run.child = null;
-        if (generation !== session.generation) {
-          void progressReporter.stop().then(() => resolve(null));
-          return;
-        }
-        void progressReporter.stop().then(() => {
-          reject(
-            new Error(
-              `Claude execution timed out after ${Math.floor(
-                EXEC_TIMEOUT_MS / 1000
-              )} seconds without new output. You can increase CODEX_EXEC_TIMEOUT_MS or set it to 0 to disable this timeout.`
-            )
-          );
-        });
-      }, EXEC_TIMEOUT_MS);
-    };
-
-    refreshExecTimeout();
-    progressReporter.start();
-
-    const handleStdoutEvent = (event) => {
-      if (!event) return;
-      progressReporter.handleEvent(event);
-    };
-
-    child.stdout.on('data', (chunk) => {
-      const text = String(chunk || '');
-      stdout += text;
-      stdoutBuffer += text;
-      const lines = stdoutBuffer.split(/\r?\n/);
-      stdoutBuffer = lines.pop() || '';
-      for (const line of lines) {
-        handleStdoutEvent(parseExecJsonEventLine(line));
+      if (sessionId) session.threadId = sessionId;
+      if (tokenUsage.lastUsage) session.lastTokenUsage = tokenUsage.lastUsage;
+      if (tokenUsage.totalUsage) {
+        session.totalTokenUsage = tokenUsage.totalUsage;
+      } else if (tokenUsage.lastUsage) {
+        session.totalTokenUsage = addTokenUsage(session.totalTokenUsage, tokenUsage.lastUsage);
       }
-      refreshExecTimeout();
-    });
+      if (events.length > 0 || sanitizeText(finalMessage)) {
+        session.hasConversation = true;
+        persistRunnerState();
+      }
 
-    child.stderr.on('data', (chunk) => {
-      stderr += String(chunk || '');
-      refreshExecTimeout();
-    });
+      if (code !== 0) {
+        const hint = describeBackendRuntimeError('claude', stderr, stdout);
+        return { error: new Error(summarizeClaudeFailure(stderr, stdout, events) + hint) };
+      }
 
-    child.on('error', (error) => {
-      if (settled) return;
-      settled = true;
-      clearExecTimeout();
-      if (run) run.child = null;
-      void (async () => {
-        await progressReporter.stop();
-        if (generation !== session.generation) {
-          resolve(null);
-          return;
-        }
-        if (error && error.code === 'ENOENT') {
-          reject(new Error(
-            `未找到 claude 可执行文件：${CLAUDE_BIN}。请安装 Claude Code CLI 或设置 CLAUDE_BIN。`
-          ));
-          return;
-        }
-        reject(error);
-      })();
-    });
+      if (claudeError) {
+        const hint = describeBackendRuntimeError('claude', stderr, stdout);
+        return { error: new Error(`Claude 返回错误：${claudeError}${hint}`) };
+      }
 
-    child.on('exit', (code, signal) => {
-      if (settled) return;
-      settled = true;
-      clearExecTimeout();
-      if (run) run.child = null;
-      void (async () => {
-        handleStdoutEvent(parseExecJsonEventLine(stdoutBuffer));
-        await progressReporter.stop();
-
-        if (generation !== session.generation) {
-          resolve(null);
-          return;
-        }
-
-        const events = parseExecJsonEvents(stdout);
-
-        if (signal) {
-          reject(new Error(`Claude process exited with signal ${signal}.`));
-          return;
-        }
-
-        const sessionId = extractSessionIdFromClaudeEvents(events);
-        const tokenUsage = extractTokenUsageFromClaudeEvents(events);
-        const claudeError = extractClaudeErrorFromEvents(events);
-        const finalMessage = extractFinalMessageFromClaudeEvents(events);
-
-        if (sessionId) {
-          session.threadId = sessionId;
-        }
-        if (tokenUsage.lastUsage) {
-          session.lastTokenUsage = tokenUsage.lastUsage;
-        }
-        if (tokenUsage.totalUsage) {
-          session.totalTokenUsage = tokenUsage.totalUsage;
-        } else if (tokenUsage.lastUsage) {
-          session.totalTokenUsage = addTokenUsage(session.totalTokenUsage, tokenUsage.lastUsage);
-        }
-        if (events.length > 0 || sanitizeText(finalMessage)) {
-          session.hasConversation = true;
-          persistRunnerState();
-        }
-
-        if (code !== 0) {
-          const hint = describeBackendRuntimeError('claude', stderr, stdout);
-          reject(new Error(summarizeClaudeFailure(stderr, stdout, events) + hint));
-          return;
-        }
-
-        if (claudeError) {
-          const hint = describeBackendRuntimeError('claude', stderr, stdout);
-          reject(new Error(`Claude 返回错误：${claudeError}${hint}`));
-          return;
-        }
-
-        const normalized = sanitizeText(finalMessage);
-        if (!normalized) {
-          reject(new Error('Claude 执行完成但未返回内容。'));
-          return;
-        }
-        resolve(normalized);
-      })();
-    });
+      const normalized = sanitizeText(finalMessage);
+      if (!normalized) return { error: new Error('Claude 执行完成但未返回内容。') };
+      return { reply: normalized };
+    }
   });
 }
 
@@ -4192,7 +3543,7 @@ async function startRunner() {
     }
     runnerState.accessMode = forceAccessMode;
     runnerState.accessModes = {};
-    persistRunnerState();
+    persistRunnerStateNow();
     log(`Forcing every session to access mode: ${forceAccessMode} (per-scope overrides cleared).`);
   }
 
@@ -4212,6 +3563,7 @@ async function startRunner() {
     process.on(signalName, async () => {
       stopAllActiveRuns(signalName);
       stopRunnerStateWatcher();
+      persistRunnerStateNow();
       const closes = [];
       for (const bot of weixinBots.values()) {
         closes.push(Promise.resolve(bot.close()).catch(() => {}));
