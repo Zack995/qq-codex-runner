@@ -889,6 +889,54 @@ function extractTokenUsageFromClaudeEvents(events) {
   return state;
 }
 
+function extractClaudeResultMeta(events) {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!event || sanitizeText(event.type) !== 'result') continue;
+    return {
+      numTurns: Number(event.num_turns || 0) || 0,
+      durationMs: Number(event.duration_ms || 0) || 0,
+      apiDurationMs: Number(event.duration_api_ms || 0) || 0,
+      totalCostUsd: Number(event.total_cost_usd || 0) || 0,
+      currentContextTokens: extractLastTurnContextSize(events)
+    };
+  }
+  return null;
+}
+
+function extractLastTurnContextSize(events) {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!event || sanitizeText(event.type) !== 'assistant') continue;
+    const usage = event.message && event.message.usage;
+    if (!usage || typeof usage !== 'object') continue;
+    const input = Math.max(0, Number(usage.input_tokens || 0) || 0);
+    const cacheCreation = Math.max(0, Number(usage.cache_creation_input_tokens || 0) || 0);
+    const cacheRead = Math.max(0, Number(usage.cache_read_input_tokens || 0) || 0);
+    const total = input + cacheCreation + cacheRead;
+    if (total > 0) return total;
+  }
+  return 0;
+}
+
+function formatClaudeContextLines(session) {
+  const meta = session && session.lastClaudeMeta;
+  const lines = [];
+  if (meta) {
+    if (meta.currentContextTokens > 0) {
+      lines.push(`当前上下文：${formatTokenNumber(meta.currentContextTokens)} tokens`);
+    }
+    const parts = [];
+    if (meta.numTurns > 0) parts.push(`内部轮数 ${meta.numTurns}`);
+    if (meta.durationMs > 0) parts.push(`耗时 ${(meta.durationMs / 1000).toFixed(1)}s`);
+    if (meta.totalCostUsd > 0) parts.push(`成本 $${meta.totalCostUsd.toFixed(4)}`);
+    if (parts.length > 0) {
+      lines.push(`本次执行：${parts.join('，')}`);
+    }
+  }
+  return lines;
+}
+
 function describeClaudeToolForProgress(name, input) {
   const tool = sanitizeText(name);
   if (!tool) return '';
@@ -1950,7 +1998,16 @@ function hydratePersistedCodexSessions(persistedState) {
       threadId,
       generation: 0,
       lastTokenUsage: normalizeTokenUsage(hydratedTokenUsage.lastUsage),
-      totalTokenUsage: normalizeTokenUsage(hydratedTokenUsage.totalUsage)
+      totalTokenUsage: normalizeTokenUsage(hydratedTokenUsage.totalUsage),
+      lastClaudeMeta: record.lastClaudeMeta && typeof record.lastClaudeMeta === 'object'
+        ? {
+            numTurns: Number(record.lastClaudeMeta.numTurns || 0) || 0,
+            durationMs: Number(record.lastClaudeMeta.durationMs || 0) || 0,
+            apiDurationMs: Number(record.lastClaudeMeta.apiDurationMs || 0) || 0,
+            totalCostUsd: Number(record.lastClaudeMeta.totalCostUsd || 0) || 0,
+            currentContextTokens: Number(record.lastClaudeMeta.currentContextTokens || 0) || 0
+          }
+        : null
     });
   }
 }
@@ -2014,7 +2071,8 @@ function buildPersistedRunnerState() {
         backend: session.backend || 'codex',
         threadId: session.threadId,
         lastTokenUsage: normalizeTokenUsage(session.lastTokenUsage),
-        totalTokenUsage: normalizeTokenUsage(session.totalTokenUsage)
+        totalTokenUsage: normalizeTokenUsage(session.totalTokenUsage),
+        lastClaudeMeta: session.lastClaudeMeta || null
       });
     }
   }
@@ -2498,9 +2556,14 @@ function getStatusMessage(context) {
       `Runner CLAUDE_CONFIG_DIR：${RUNNER_CLAUDE_HOME || '继承系统默认'}`,
       `Claude 权限模式：${permissionMode}`
     );
+    for (const extra of formatClaudeContextLines(currentSession)) {
+      lines.push(extra);
+    }
   }
 
-  lines.push(`最近一轮 Token：${formatTokenUsage(tokenUsage.lastUsage)}`);
+  lines.push(
+    `${backend === 'claude' ? '最近一次执行 Token（CLI 调用累计含内部多轮）' : '最近一轮 Token'}：${formatTokenUsage(tokenUsage.lastUsage)}`
+  );
   return lines.join('\n');
 }
 
@@ -2573,9 +2636,14 @@ function getSessionMessage(context) {
       `Runner CLAUDE_CONFIG_DIR：${RUNNER_CLAUDE_HOME || '继承系统默认'}`,
       `Claude 权限模式：${permissionMode}`
     );
+    for (const extra of formatClaudeContextLines(currentSession)) {
+      lines.push(extra);
+    }
   }
 
-  lines.push(`最近一轮 Token：${formatTokenUsage(tokenUsage.lastUsage)}`);
+  lines.push(
+    `${backend === 'claude' ? '最近一次执行 Token（CLI 调用累计含内部多轮）' : '最近一轮 Token'}：${formatTokenUsage(tokenUsage.lastUsage)}`
+  );
   if (callerPending) {
     lines.push(`待审批命令：${callerPending.command}`);
   }
@@ -3089,6 +3157,7 @@ function runClaudeExecOnce(prompt, session, workdir, context, run, accessMode) {
       const tokenUsage = extractTokenUsageFromClaudeEvents(events);
       const claudeError = extractClaudeErrorFromEvents(events);
       const finalMessage = extractFinalMessageFromClaudeEvents(events);
+      const meta = extractClaudeResultMeta(events);
 
       if (sessionId) session.threadId = sessionId;
       if (tokenUsage.lastUsage) session.lastTokenUsage = tokenUsage.lastUsage;
@@ -3096,6 +3165,9 @@ function runClaudeExecOnce(prompt, session, workdir, context, run, accessMode) {
         session.totalTokenUsage = tokenUsage.totalUsage;
       } else if (tokenUsage.lastUsage) {
         session.totalTokenUsage = addTokenUsage(session.totalTokenUsage, tokenUsage.lastUsage);
+      }
+      if (meta) {
+        session.lastClaudeMeta = meta;
       }
       if (events.length > 0 || sanitizeText(finalMessage)) {
         session.hasConversation = true;
