@@ -3166,7 +3166,7 @@ function runClaudeExecOnce(prompt, session, workdir, context, run, accessMode) {
       } else if (tokenUsage.lastUsage) {
         session.totalTokenUsage = addTokenUsage(session.totalTokenUsage, tokenUsage.lastUsage);
       }
-      if (meta) {
+      if (meta && meta.numTurns > 0) {
         session.lastClaudeMeta = meta;
       }
       if (events.length > 0 || sanitizeText(finalMessage)) {
