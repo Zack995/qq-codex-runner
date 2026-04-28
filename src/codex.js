@@ -43,6 +43,10 @@ function setCodexExtraArgs(args) {
   codexExtraArgs = Array.isArray(args) ? args.slice() : [];
 }
 
+function getCodexBin() {
+  return codexBin;
+}
+
 function summarizeExecFailure(stderr, stdout) {
   const combined = sanitizeText([stderr, stdout].filter(Boolean).join('\n'));
   if (!combined) return 'Codex did not return readable output.';
@@ -345,6 +349,7 @@ function runCodexExec(prompt, session, workdir, context, run, accessMode) {
 module.exports = {
   setCodexBin,
   setCodexExtraArgs,
+  getCodexBin,
   summarizeExecFailure,
   summarizeCommandForProgress,
   describeFunctionCallForProgress,
