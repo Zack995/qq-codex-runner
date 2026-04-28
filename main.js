@@ -169,410 +169,76 @@ const {
   refreshWeixinClients
 } = require('./src/weixin');
 
-function summarizeExecFailure(stderr, stdout) {
-  const combined = sanitizeText([stderr, stdout].filter(Boolean).join('\n'));
-  if (!combined) return 'Codex did not return readable output.';
-  return combined.split('\n').slice(-12).join('\n');
-}
+const exec = require('./src/exec');
+const {
+  setSendReplyImpl,
+  spawnProbeVersion,
+  summarizeProbeFailure,
+  describeBackendRuntimeError,
+  formatProgressReply,
+  createProgressReporter,
+  runAgentChildProcess
+} = exec;
 
-function summarizeCommandForProgress(commandText) {
-  const normalized = compactWhitespace(commandText);
-  if (!normalized) return '正在执行终端命令';
-  if (normalized.length <= 80) {
-    return `正在执行命令：${normalized}`;
-  }
-  return `正在执行命令：${normalized.slice(0, 77)}...`;
-}
+const codex = require('./src/codex');
+const {
+  setCodexBin,
+  setCodexExtraArgs,
+  summarizeExecFailure,
+  summarizeCommandForProgress,
+  describeFunctionCallForProgress,
+  extractProgressUpdateFromExecEvent,
+  parseApprovalRequest,
+  APPROVAL_POLICY_PROMPT,
+  buildAgentPolicyPrompt,
+  buildChatTurnPrompt,
+  buildApprovalTurnPrompt,
+  buildUserPrompt,
+  buildApprovalPrompt,
+  buildCodexArgs,
+  runCodexExec
+} = codex;
 
-function describeFunctionCallForProgress(name, argumentsText) {
-  const normalizedName = sanitizeText(name);
-  if (!normalizedName) return '';
+const {
+  normalizeClaudeUsage,
+  extractSessionIdFromClaudeEvents,
+  extractFinalMessageFromClaudeEvents,
+  extractClaudeErrorFromEvents,
+  isClaudeSessionNotFoundError,
+  extractTokenUsageFromClaudeEvents,
+  extractClaudeResultMeta,
+  extractLastTurnContextSize,
+  formatClaudeContextLines,
+  describeClaudeToolForProgress,
+  extractProgressUpdateFromClaudeEvent,
+  summarizeClaudeFailure,
+  buildClaudeArgs,
+  runClaudeExec,
+  runClaudeExecOnce
+} = require('./src/claude');
 
-  if (normalizedName === 'exec_command') {
-    try {
-      const parsed = JSON.parse(argumentsText || '{}');
-      return summarizeCommandForProgress(parsed.cmd);
-    } catch (_) {
-      return '正在执行终端命令';
-    }
-  }
+const { command, codexArgs, mode, weixinAccountId, weixinLoginForce, weixinName, forceAccessMode } = parseArgs(process.argv.slice(2));
+setCodexBin(command);
+setCodexExtraArgs(codexArgs);
 
-  if (normalizedName === 'write_stdin') {
-    return '正在等待终端命令输出';
-  }
-  if (normalizedName === 'apply_patch') {
-    return '正在修改文件';
-  }
-  if (normalizedName === 'parallel') {
-    return '正在并行收集信息';
-  }
-  if (normalizedName === 'spawn_agent') {
-    return '正在分派子任务';
-  }
-  if (normalizedName === 'wait_agent') {
-    return '正在等待子任务结果';
-  }
-  if (normalizedName === 'send_input') {
-    return '正在向子任务补充信息';
-  }
-  if (normalizedName === 'open' || normalizedName === 'click' || normalizedName === 'find') {
-    return '正在读取页面内容';
-  }
-  if (normalizedName === 'search_query' || normalizedName === 'image_query') {
-    return '正在搜索资料';
-  }
-  if (normalizedName === 'finance') {
-    return '正在查询行情';
-  }
-  if (normalizedName === 'weather') {
-    return '正在查询天气';
-  }
-  if (normalizedName === 'sports') {
-    return '正在查询赛程数据';
-  }
-  if (normalizedName === 'time') {
-    return '正在查询时间信息';
-  }
 
-  return `正在调用工具：${normalizedName}`;
-}
 
-function extractProgressUpdateFromExecEvent(event) {
-  if (!event || typeof event !== 'object') return null;
 
-  if (sanitizeText(event.type) === 'item.started' || sanitizeText(event.type) === 'item.completed') {
-    const item = event.item;
-    if (!item || typeof item !== 'object') return null;
 
-    if (sanitizeText(item.type) === 'agent_message') {
-      const message = sanitizeText(item.text);
-      if (!message) return null;
-      return {
-        kind: 'agent_message',
-        message,
-        activitySummary: compactWhitespace(message)
-      };
-    }
 
-    if (sanitizeText(item.type) === 'command_execution') {
-      const summary = summarizeCommandForProgress(item.command);
-      return {
-        kind: 'command_execution',
-        message: '',
-        activitySummary: summary
-      };
-    }
-  }
 
-  if (sanitizeText(event.type) === 'event_msg') {
-    const payload = event.payload;
-    if (!payload || typeof payload !== 'object') return null;
 
-    if (sanitizeText(payload.type) === 'agent_message' && sanitizeText(payload.phase) === 'commentary') {
-      const message = sanitizeText(payload.message);
-      if (!message) return null;
-      return {
-        kind: 'agent_message',
-        message,
-        activitySummary: compactWhitespace(message)
-      };
-    }
 
-    if (sanitizeText(payload.type) === 'task_started') {
-      return {
-        kind: 'task_started',
-        message: '',
-        activitySummary: '任务已启动，正在整理上下文'
-      };
-    }
 
-    return null;
-  }
 
-  if (sanitizeText(event.type) === 'response_item') {
-    const payload = event.payload;
-    if (!payload || typeof payload !== 'object') return null;
-    if (sanitizeText(payload.type) !== 'function_call') return null;
 
-    const activitySummary = describeFunctionCallForProgress(payload.name, payload.arguments);
-    if (!activitySummary) return null;
-    return {
-      kind: 'function_call',
-      message: '',
-      activitySummary
-    };
-  }
 
-  return null;
-}
 
-function formatProgressReply(message) {
-  const normalized = sanitizeText(message);
-  if (!normalized) return '';
-  return `进度：\n${normalized}`;
-}
 
-function normalizeClaudeUsage(value) {
-  if (!value || typeof value !== 'object') return null;
-  const input = Math.max(0, Number(value.input_tokens || 0) || 0);
-  const cacheCreation = Math.max(0, Number(value.cache_creation_input_tokens || 0) || 0);
-  const cacheRead = Math.max(0, Number(value.cache_read_input_tokens || 0) || 0);
-  const output = Math.max(0, Number(value.output_tokens || 0) || 0);
-  if (input === 0 && cacheCreation === 0 && cacheRead === 0 && output === 0) return null;
-  return normalizeTokenUsage({
-    input_tokens: input + cacheCreation,
-    cached_input_tokens: cacheRead,
-    output_tokens: output,
-    total_tokens: input + cacheCreation + cacheRead + output
-  });
-}
 
-function extractSessionIdFromClaudeEvents(events) {
-  for (const event of events) {
-    if (!event || typeof event !== 'object') continue;
-    if (sanitizeText(event.type) === 'system' && sanitizeText(event.subtype) === 'init') {
-      const sid = sanitizeText(event.session_id);
-      if (sid) return sid;
-    }
-  }
-  for (const event of events) {
-    if (!event || typeof event !== 'object') continue;
-    if (sanitizeText(event.type) === 'result') {
-      const sid = sanitizeText(event.session_id);
-      if (sid) return sid;
-    }
-  }
-  return null;
-}
 
-function extractFinalMessageFromClaudeEvents(events) {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (!event || sanitizeText(event.type) !== 'result') continue;
-    if (event.is_error) return '';
-    const text = sanitizeText(event.result);
-    if (text) return text;
-  }
-  const textParts = [];
-  for (const event of events) {
-    if (!event || sanitizeText(event.type) !== 'assistant') continue;
-    const content = event.message && Array.isArray(event.message.content) ? event.message.content : [];
-    for (const block of content) {
-      if (block && block.type === 'text' && typeof block.text === 'string') {
-        const normalized = sanitizeText(block.text);
-        if (normalized) textParts.push(normalized);
-      }
-    }
-  }
-  return sanitizeText(textParts.join('\n'));
-}
 
-function extractClaudeErrorFromEvents(events) {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (!event || sanitizeText(event.type) !== 'result') continue;
-    const subtype = sanitizeText(event.subtype);
-    if (!event.is_error && subtype !== 'error' && !subtype.startsWith('error')) continue;
-    if (Array.isArray(event.errors) && event.errors.length > 0) {
-      const combined = event.errors.map((entry) => sanitizeText(entry)).filter(Boolean).join('; ');
-      if (combined) return combined;
-    }
-    const direct = sanitizeText(event.result || event.error || event.message);
-    if (direct) return direct;
-    return 'Claude 返回错误但未提供详细信息';
-  }
-  return '';
-}
 
-function isClaudeSessionNotFoundError(message) {
-  return /no\s+conversation\s+found/i.test(String(message || ''));
-}
-
-function extractTokenUsageFromClaudeEvents(events) {
-  const state = { lastUsage: null, totalUsage: null };
-  for (const event of events) {
-    if (!event || typeof event !== 'object') continue;
-    if (sanitizeText(event.type) === 'result' && event.usage) {
-      const usage = normalizeClaudeUsage(event.usage);
-      if (usage) state.lastUsage = usage;
-    }
-  }
-  return state;
-}
-
-function extractClaudeResultMeta(events) {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (!event || sanitizeText(event.type) !== 'result') continue;
-    return {
-      numTurns: Number(event.num_turns || 0) || 0,
-      durationMs: Number(event.duration_ms || 0) || 0,
-      apiDurationMs: Number(event.duration_api_ms || 0) || 0,
-      totalCostUsd: Number(event.total_cost_usd || 0) || 0,
-      currentContextTokens: extractLastTurnContextSize(events)
-    };
-  }
-  return null;
-}
-
-function extractLastTurnContextSize(events) {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (!event || sanitizeText(event.type) !== 'assistant') continue;
-    const usage = event.message && event.message.usage;
-    if (!usage || typeof usage !== 'object') continue;
-    const input = Math.max(0, Number(usage.input_tokens || 0) || 0);
-    const cacheCreation = Math.max(0, Number(usage.cache_creation_input_tokens || 0) || 0);
-    const cacheRead = Math.max(0, Number(usage.cache_read_input_tokens || 0) || 0);
-    const total = input + cacheCreation + cacheRead;
-    if (total > 0) return total;
-  }
-  return 0;
-}
-
-function formatClaudeContextLines(session) {
-  const meta = session && session.lastClaudeMeta;
-  const lines = [];
-  if (meta) {
-    if (meta.currentContextTokens > 0) {
-      lines.push(`当前上下文：${formatTokenNumber(meta.currentContextTokens)} tokens`);
-    }
-    const parts = [];
-    if (meta.numTurns > 0) parts.push(`内部轮数 ${meta.numTurns}`);
-    if (meta.durationMs > 0) parts.push(`耗时 ${(meta.durationMs / 1000).toFixed(1)}s`);
-    if (meta.totalCostUsd > 0) parts.push(`成本 $${meta.totalCostUsd.toFixed(4)}`);
-    if (parts.length > 0) {
-      lines.push(`本次执行：${parts.join('，')}`);
-    }
-  }
-  return lines;
-}
-
-function describeClaudeToolForProgress(name, input) {
-  const tool = sanitizeText(name);
-  if (!tool) return '';
-  if (tool === 'Bash') {
-    if (input && typeof input === 'object') {
-      const cmd = sanitizeText(input.command);
-      if (cmd) return summarizeCommandForProgress(cmd);
-    }
-    return '正在执行终端命令';
-  }
-  if (tool === 'Read') return '正在读取文件';
-  if (tool === 'Edit' || tool === 'MultiEdit' || tool === 'Write' || tool === 'NotebookEdit') {
-    return '正在修改文件';
-  }
-  if (tool === 'Glob' || tool === 'Grep') return '正在搜索文件';
-  if (tool === 'WebFetch') return '正在读取网页';
-  if (tool === 'WebSearch') return '正在搜索资料';
-  if (tool === 'TodoWrite') return '正在更新任务清单';
-  if (tool === 'Task') return '正在分派子任务';
-  if (tool === 'Agent') return '正在分派子代理';
-  return `正在调用工具：${tool}`;
-}
-
-function extractProgressUpdateFromClaudeEvent(event) {
-  if (!event || typeof event !== 'object') return null;
-  const type = sanitizeText(event.type);
-  if (type === 'system' && sanitizeText(event.subtype) === 'init') {
-    return {
-      kind: 'task_started',
-      message: '',
-      activitySummary: '任务已启动，正在整理上下文'
-    };
-  }
-  if (type !== 'assistant') return null;
-  const content = event.message && Array.isArray(event.message.content) ? event.message.content : [];
-  for (const block of content) {
-    if (!block || typeof block !== 'object') continue;
-    if (block.type === 'tool_use') {
-      const summary = describeClaudeToolForProgress(block.name, block.input);
-      if (!summary) continue;
-      return {
-        kind: 'command_execution',
-        message: '',
-        activitySummary: summary
-      };
-    }
-    if (block.type === 'text' && typeof block.text === 'string') {
-      const text = sanitizeText(block.text);
-      if (!text) continue;
-      return {
-        kind: 'agent_message',
-        message: '',
-        activitySummary: compactWhitespace(text)
-      };
-    }
-  }
-  return null;
-}
-
-function parseApprovalRequest(message) {
-  const match = String(message || '').match(
-    /<approval_request>\s*<command>([\s\S]*?)<\/command>\s*<reason>([\s\S]*?)<\/reason>\s*<\/approval_request>/i
-  );
-  if (!match) return null;
-  const command = sanitizeText(match[1]);
-  const reason = sanitizeText(match[2]);
-  if (!command) return null;
-  return { command, reason };
-}
-
-function spawnProbeVersion(bin, args = ['--version'], timeoutMs = BACKEND_PROBE_TIMEOUT_MS) {
-  return new Promise((resolve) => {
-    let child;
-    try {
-      child = childProcess.spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    } catch (error) {
-      resolve({
-        ok: false,
-        error: (error && error.code) || 'SPAWN_FAILED',
-        message: error && error.message ? error.message : String(error)
-      });
-      return;
-    }
-
-    let stdout = '';
-    let stderr = '';
-    let settled = false;
-
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      try { child.kill('SIGKILL'); } catch (_) {}
-      resolve({ ok: false, error: 'TIMEOUT', stdout, stderr });
-    }, timeoutMs);
-
-    child.stdout.on('data', (chunk) => { stdout += String(chunk); });
-    child.stderr.on('data', (chunk) => { stderr += String(chunk); });
-
-    child.on('error', (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({
-        ok: false,
-        error: (error && error.code) || 'ERROR',
-        message: error && error.message ? error.message : String(error),
-        stdout,
-        stderr
-      });
-    });
-
-    child.on('exit', (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({ ok: code === 0, code, stdout, stderr });
-    });
-  });
-}
-
-function summarizeProbeFailure(probe) {
-  const detail = sanitizeText(probe.message || probe.stderr || probe.stdout || '');
-  if (!detail) return probe.error || 'unknown';
-  return detail.split('\n').slice(-3).join('\n');
-}
 
 async function checkBackendAvailability(backend) {
   if (backend === 'codex') {
@@ -643,27 +309,6 @@ async function checkBackendAvailability(backend) {
   return { ok: false, reason: 'unknown_backend', message: `未知后端：${backend}` };
 }
 
-function describeBackendRuntimeError(backend, stderr, stdout) {
-  const combined = sanitizeText([stderr, stdout].filter(Boolean).join('\n')).toLowerCase();
-  if (!combined) return '';
-  const authPatterns = [
-    /\b401\b/,
-    /\b403\b/,
-    /unauthoriz/,
-    /unauthenticat/,
-    /invalid[\s_-]*api[\s_-]*key/,
-    /not\s*logged\s*in/,
-    /please\s*log\s*in/,
-    /authentication\s*failed/,
-    /expired[\s_-]*token/,
-    /credential/
-  ];
-  if (!authPatterns.some((pattern) => pattern.test(combined))) return '';
-  if (backend === 'claude') {
-    return '\n提示：疑似 Claude 认证问题。请运行 `claude login`，或检查 ANTHROPIC_API_KEY / CLAUDE_CONFIG_DIR 是否有效。';
-  }
-  return '\n提示：疑似 Codex 认证问题。请运行 `codex login`，或检查 OPENAI_API_KEY / CODEX_HOME 是否有效。';
-}
 
 
 
@@ -672,86 +317,14 @@ function describeBackendRuntimeError(backend, stderr, stdout) {
 
 
 
-const APPROVAL_POLICY_PROMPT = [
-  'You are working through a chat bot runner.',
-  'Use normal Codex behavior for low-risk read-only work.',
-  'If you need to run a higher-risk shell command, do not execute it immediately.',
-  'Instead, output exactly this block and nothing else:',
-  '<approval_request>',
-  '<command>full command</command>',
-  '<reason>one short reason</reason>',
-  '</approval_request>',
-  'When the user later replies /allow, continue and execute that approved command.',
-  'When the user replies /skip, do not execute that command and try another path.',
-  'When the user replies /reject, cancel the current task.'
-].join('\n');
 
-function buildAgentPolicyPrompt(accessMode) {
-  const mode = sanitizeText(accessMode).toLowerCase() || runnerState.accessMode;
-  if (mode === 'full') {
-    return [
-      '你正在通过聊天机器人与用户协作。',
-      '当前权限模式是完全访问。',
-      '你可以直接执行完成任务所需的操作。'
-    ].join('\n');
-  }
 
-  return APPROVAL_POLICY_PROMPT;
-}
 
-function buildUserPrompt(input, options = {}) {
-  return buildChatTurnPrompt(input, options);
-}
-
-function buildApprovalPrompt(action, pendingApproval, options = {}) {
-  return buildApprovalTurnPrompt(action, pendingApproval, options);
-}
 
 loadDotEnv();
 
-const { command, codexArgs, mode, weixinAccountId, weixinLoginForce, weixinName, forceAccessMode } = parseArgs(process.argv.slice(2));
 
-function buildChatTurnPrompt(input, options = {}) {
-  const includePolicy = options.includePolicy !== false;
-  const backend = options.backend || 'codex';
-  const accessMode = options.accessMode;
-  const parts = [];
-  if (includePolicy && backend === 'codex') {
-    parts.push(buildAgentPolicyPrompt(accessMode), '');
-  }
-  parts.push(`[User message]\n${input}\n[/User message]`);
-  return parts.join('\n');
-}
 
-function buildApprovalTurnPrompt(action, approval, options = {}) {
-  const includePolicy = options.includePolicy !== false;
-  const accessMode = options.accessMode;
-  const parts = [];
-  if (includePolicy) {
-    parts.push(buildAgentPolicyPrompt(accessMode), '');
-  }
-
-  if (!approval) {
-    return parts.join('\n').trim();
-  }
-
-  if (action === 'allow') {
-    parts.push(
-      'The user approved your last requested command.',
-      `Approved command: ${approval.command}`,
-      `Reason: ${approval.reason || 'not provided'}`,
-      'Continue the original task.'
-    );
-    return parts.join('\n');
-  }
-
-  parts.push(
-    'The user rejected the last requested command for execution.',
-    `Blocked command: ${approval.command}`,
-    'Continue the original task without executing that command.'
-  );
-  return parts.join('\n');
-}
 
 
 
@@ -1285,407 +858,17 @@ async function safeSendReply(context, content) {
   }
 }
 
-function createProgressReporter(context, parseEvent = extractProgressUpdateFromExecEvent) {
-  let closed = false;
-  let lastSentMessage = '';
-  let lastSentAt = 0;
-  let lastActivitySummary = '仍在处理中，请稍候。';
-  let sawCommandExecution = false;
-  let sendChain = Promise.resolve();
-  let heartbeatTimer = null;
+// Wire safeSendReply into the exec layer so progress reporter and
+// claude.js's session-not-found recovery message can write to chat.
+setSendReplyImpl(safeSendReply);
 
-  const queueSend = (message, options = {}) => {
-    const normalized = sanitizeText(message);
-    if (!normalized || closed) return;
-    if (!options.force && normalized === lastSentMessage) return;
 
-    sendChain = sendChain
-      .catch(() => {})
-      .then(async () => {
-        if (closed) return;
-        lastSentMessage = normalized;
-        lastSentAt = Date.now();
-        await safeSendReply(context, normalized);
-      });
-  };
 
-  return {
-    start() {
-      if (heartbeatTimer) return;
-      heartbeatTimer = setInterval(() => {
-        if (closed) return;
-        if (Date.now() - lastSentAt < PROGRESS_HEARTBEAT_INTERVAL_MS) return;
-        queueSend(formatProgressReply(lastActivitySummary));
-      }, PROGRESS_HEARTBEAT_INTERVAL_MS);
-    },
-    handleEvent(event) {
-      const progress = parseEvent(event);
-      if (!progress) return;
-      if (sanitizeText(progress.activitySummary)) {
-        lastActivitySummary = sanitizeText(progress.activitySummary);
-      }
-      if (progress.kind === 'command_execution') {
-        sawCommandExecution = true;
-      }
-      if (sanitizeText(progress.message)) {
-        if (progress.kind === 'agent_message' && sawCommandExecution) {
-          return;
-        }
-        queueSend(formatProgressReply(progress.message));
-      }
-    },
-    async stop() {
-      closed = true;
-      if (heartbeatTimer) {
-        clearInterval(heartbeatTimer);
-        heartbeatTimer = null;
-      }
-      await sendChain.catch(() => {});
-    }
-  };
-}
 
-function buildCodexArgs(prompt, outputFile, session, workdir, accessMode) {
-  const args = ['exec'];
-  const mode = sanitizeText(accessMode).toLowerCase() || runnerState.accessMode;
-  const accessConfig = VALID_ACCESS_MODES.get(mode) || VALID_ACCESS_MODES.get('safe');
-  args.push('-C', workdir);
-  args.push('-s', accessConfig.sandbox);
-  if (CODEX_CONTEXT_WINDOW_OVERRIDE) {
-    args.push('-c', `model_context_window=${CODEX_CONTEXT_WINDOW_OVERRIDE}`);
-  }
-  if (CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE) {
-    args.push('-c', `model_auto_compact_token_limit=${CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE}`);
-  }
-  for (const addDir of runnerState.addDirs) {
-    args.push('--add-dir', addDir);
-  }
-  if (accessConfig.bypass) {
-    args.push('--dangerously-bypass-approvals-and-sandbox');
-  }
-  if (session && session.hasConversation && session.threadId) {
-    args.push('resume', session.threadId);
-  }
-  args.push('--skip-git-repo-check', '--json', '--output-last-message', outputFile);
-  args.push(...codexArgs);
-  args.push(prompt);
-  return args;
-}
 
-function runAgentChildProcess(options) {
-  const {
-    bin,
-    args,
-    cwd,
-    env,
-    session,
-    run,
-    context,
-    parseEvent,
-    timeoutLabel,
-    spawnErrorMapper,
-    onSuccess
-  } = options;
 
-  return new Promise((resolve, reject) => {
-    const generation = session.generation;
-    const progressReporter = createProgressReporter(context, parseEvent);
 
-    let child;
-    try {
-      child = childProcess.spawn(bin, args, {
-        cwd,
-        env,
-        stdio: ['ignore', 'pipe', 'pipe']
-      });
-    } catch (error) {
-      void progressReporter.stop().then(() => {
-        const mapped = spawnErrorMapper ? spawnErrorMapper(error) : null;
-        reject(mapped || error);
-      });
-      return;
-    }
 
-    if (run) run.child = child;
-
-    let stdout = '';
-    let stdoutBuffer = '';
-    let stderr = '';
-    let settled = false;
-    let timeout = null;
-
-    const clearExecTimeout = () => {
-      if (!timeout) return;
-      clearTimeout(timeout);
-      timeout = null;
-    };
-
-    const refreshExecTimeout = () => {
-      if (EXEC_TIMEOUT_DISABLED || settled) return;
-      clearExecTimeout();
-      timeout = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        try { child.kill('SIGTERM'); } catch (_) {}
-        if (run) run.child = null;
-        void progressReporter.stop().then(() => {
-          if (generation !== session.generation) {
-            resolve(null);
-            return;
-          }
-          reject(new Error(
-            `${timeoutLabel} execution timed out after ${Math.floor(
-              EXEC_TIMEOUT_MS / 1000
-            )} seconds without new output. You can increase CODEX_EXEC_TIMEOUT_MS or set it to 0 to disable this timeout.`
-          ));
-        });
-      }, EXEC_TIMEOUT_MS);
-    };
-
-    refreshExecTimeout();
-    progressReporter.start();
-
-    const handleStdoutEvent = (event) => {
-      if (!event) return;
-      progressReporter.handleEvent(event);
-    };
-
-    child.stdout.on('data', (chunk) => {
-      const text = String(chunk || '');
-      stdout += text;
-      stdoutBuffer += text;
-      const lines = stdoutBuffer.split(/\r?\n/);
-      stdoutBuffer = lines.pop() || '';
-      for (const line of lines) {
-        handleStdoutEvent(parseExecJsonEventLine(line));
-      }
-      refreshExecTimeout();
-    });
-
-    child.stderr.on('data', (chunk) => {
-      stderr += String(chunk || '');
-      refreshExecTimeout();
-    });
-
-    child.on('error', (error) => {
-      if (settled) return;
-      settled = true;
-      clearExecTimeout();
-      if (run) run.child = null;
-      void (async () => {
-        await progressReporter.stop();
-        if (generation !== session.generation) {
-          resolve(null);
-          return;
-        }
-        const mapped = spawnErrorMapper ? spawnErrorMapper(error) : null;
-        reject(mapped || error);
-      })();
-    });
-
-    child.on('exit', (code, signal) => {
-      if (settled) return;
-      settled = true;
-      clearExecTimeout();
-      if (run) run.child = null;
-      void (async () => {
-        handleStdoutEvent(parseExecJsonEventLine(stdoutBuffer));
-        await progressReporter.stop();
-
-        if (generation !== session.generation) {
-          resolve(null);
-          return;
-        }
-
-        if (signal) {
-          reject(new Error(`${timeoutLabel} process exited with signal ${signal}.`));
-          return;
-        }
-
-        const events = parseExecJsonEvents(stdout);
-        try {
-          const result = await onSuccess({ code, stdout, stderr, events });
-          if (result && result.error) {
-            reject(result.error);
-            return;
-          }
-          resolve(result && result.reply ? result.reply : null);
-        } catch (err) {
-          reject(err);
-        }
-      })();
-    });
-  });
-}
-
-function runCodexExec(prompt, session, workdir, context, run, accessMode) {
-  const outputFile = path.join(os.tmpdir(), `qq-codex-runner-last-${process.pid}-${Date.now()}.txt`);
-  const args = buildCodexArgs(prompt, outputFile, session, workdir, accessMode);
-  const env = { ...process.env, TERM: process.env.TERM || 'xterm-256color' };
-  if (RUNNER_CODEX_HOME) env.CODEX_HOME = RUNNER_CODEX_HOME;
-
-  return runAgentChildProcess({
-    bin: command,
-    args,
-    cwd: workdir,
-    env,
-    session,
-    run,
-    context,
-    parseEvent: extractProgressUpdateFromExecEvent,
-    timeoutLabel: 'Codex',
-    onSuccess: async ({ code, stdout, stderr, events }) => {
-      let finalMessage = '';
-      try { finalMessage = fs.readFileSync(outputFile, 'utf8'); } catch (_) {}
-      try { fs.unlinkSync(outputFile); } catch (_) {}
-
-      if (code !== 0) {
-        const hint = describeBackendRuntimeError('codex', stderr, stdout);
-        return { error: new Error(summarizeExecFailure(stderr, stdout) + hint) };
-      }
-
-      const threadId = extractThreadIdFromExecEvents(events);
-      const tokenUsage = extractTokenUsageFromExecEvents(events);
-      if (threadId) session.threadId = threadId;
-      if (tokenUsage.lastUsage) session.lastTokenUsage = tokenUsage.lastUsage;
-      if (tokenUsage.totalUsage) {
-        session.totalTokenUsage = tokenUsage.totalUsage;
-      } else if (tokenUsage.lastUsage) {
-        session.totalTokenUsage = addTokenUsage(session.totalTokenUsage, tokenUsage.lastUsage);
-      }
-      if (events.length > 0 || sanitizeText(finalMessage)) {
-        session.hasConversation = true;
-        persistRunnerState();
-      }
-
-      const normalized = sanitizeText(finalMessage);
-      if (!normalized) return { error: new Error('Codex finished without a final reply.') };
-      return { reply: normalized };
-    }
-  });
-}
-
-function buildClaudeArgs(prompt, session, workdir, accessMode) {
-  void workdir;
-  const args = [
-    '-p',
-    '--output-format', 'stream-json',
-    '--verbose',
-    '--include-partial-messages'
-  ];
-  const mode = sanitizeText(accessMode).toLowerCase() || runnerState.accessMode;
-  const permissionMode = CLAUDE_PERMISSION_MODE_BY_ACCESS[mode] || 'default';
-  args.push('--permission-mode', permissionMode);
-  for (const addDir of runnerState.addDirs) {
-    args.push('--add-dir', addDir);
-  }
-  if (session && session.hasConversation && session.threadId) {
-    args.push('--resume', session.threadId);
-  }
-  args.push(prompt);
-  return args;
-}
-
-function summarizeClaudeFailure(stderr, stdout, events) {
-  const errorMessage = extractClaudeErrorFromEvents(events || []);
-  if (errorMessage) return errorMessage;
-  const combined = sanitizeText([stderr, stdout].filter(Boolean).join('\n'));
-  if (!combined) return 'Claude 未返回可解析的输出。';
-  return combined.split('\n').slice(-12).join('\n');
-}
-
-async function runClaudeExec(prompt, session, workdir, context, run, accessMode) {
-  try {
-    return await runClaudeExecOnce(prompt, session, workdir, context, run, accessMode);
-  } catch (error) {
-    const message = String(error && error.message ? error.message : error);
-    if (
-      session &&
-      session.hasConversation &&
-      session.threadId &&
-      isClaudeSessionNotFoundError(message)
-    ) {
-      log(
-        `Claude session ${session.threadId} not found on this machine; resetting and retrying as a new session.`
-      );
-      session.threadId = null;
-      session.hasConversation = false;
-      session.lastTokenUsage = null;
-      bumpSessionGeneration(session);
-      persistRunnerState();
-      await safeSendReply(
-        context,
-        '原 session 在本机找不到（可能换了机器或 session 被清），已自动新开一次会话并重试。'
-      ).catch(() => {});
-      return runClaudeExecOnce(prompt, session, workdir, context, run, accessMode);
-    }
-    throw error;
-  }
-}
-
-function runClaudeExecOnce(prompt, session, workdir, context, run, accessMode) {
-  const args = buildClaudeArgs(prompt, session, workdir, accessMode);
-  const env = { ...process.env, TERM: process.env.TERM || 'xterm-256color' };
-  if (RUNNER_CLAUDE_HOME) env.CLAUDE_CONFIG_DIR = RUNNER_CLAUDE_HOME;
-
-  const claudeSpawnErrorMapper = (error) => {
-    if (error && error.code === 'ENOENT') {
-      return new Error(
-        `未找到 claude 可执行文件：${CLAUDE_BIN}。请安装 Claude Code CLI 或设置 CLAUDE_BIN。`
-      );
-    }
-    return null;
-  };
-
-  return runAgentChildProcess({
-    bin: CLAUDE_BIN,
-    args,
-    cwd: workdir,
-    env,
-    session,
-    run,
-    context,
-    parseEvent: extractProgressUpdateFromClaudeEvent,
-    timeoutLabel: 'Claude',
-    spawnErrorMapper: claudeSpawnErrorMapper,
-    onSuccess: async ({ code, stdout, stderr, events }) => {
-      const sessionId = extractSessionIdFromClaudeEvents(events);
-      const tokenUsage = extractTokenUsageFromClaudeEvents(events);
-      const claudeError = extractClaudeErrorFromEvents(events);
-      const finalMessage = extractFinalMessageFromClaudeEvents(events);
-      const meta = extractClaudeResultMeta(events);
-
-      if (sessionId) session.threadId = sessionId;
-      if (tokenUsage.lastUsage) session.lastTokenUsage = tokenUsage.lastUsage;
-      if (tokenUsage.totalUsage) {
-        session.totalTokenUsage = tokenUsage.totalUsage;
-      } else if (tokenUsage.lastUsage) {
-        session.totalTokenUsage = addTokenUsage(session.totalTokenUsage, tokenUsage.lastUsage);
-      }
-      if (meta && meta.numTurns > 0) {
-        session.lastClaudeMeta = meta;
-      }
-      if (events.length > 0 || sanitizeText(finalMessage)) {
-        session.hasConversation = true;
-        persistRunnerState();
-      }
-
-      if (code !== 0) {
-        const hint = describeBackendRuntimeError('claude', stderr, stdout);
-        return { error: new Error(summarizeClaudeFailure(stderr, stdout, events) + hint) };
-      }
-
-      if (claudeError) {
-        const hint = describeBackendRuntimeError('claude', stderr, stdout);
-        return { error: new Error(`Claude 返回错误：${claudeError}${hint}`) };
-      }
-
-      const normalized = sanitizeText(finalMessage);
-      if (!normalized) return { error: new Error('Claude 执行完成但未返回内容。') };
-      return { reply: normalized };
-    }
-  });
-}
 
 async function resetCodexSession(context) {
   const scopeKey = getContextSessionScopeKey(context);
