@@ -122,16 +122,6 @@ function extractProgressUpdateFromExecEvent(event) {
     const item = event.item;
     if (!item || typeof item !== 'object') return null;
 
-    if (sanitizeText(item.type) === 'agent_message') {
-      const message = sanitizeText(item.text);
-      if (!message) return null;
-      return {
-        kind: 'agent_message',
-        message,
-        activitySummary: compactWhitespace(message)
-      };
-    }
-
     if (sanitizeText(item.type) === 'command_execution') {
       const summary = summarizeCommandForProgress(item.command);
       return {
@@ -146,6 +136,10 @@ function extractProgressUpdateFromExecEvent(event) {
     const payload = event.payload;
     if (!payload || typeof payload !== 'object') return null;
 
+    // Codex final answers arrive as item.completed/agent_message and are also
+    // written to --output-last-message. Only commentary should be streamed as
+    // progress, otherwise the chat sees the same content once as "进度" and
+    // again as the final reply.
     if (sanitizeText(payload.type) === 'agent_message' && sanitizeText(payload.phase) === 'commentary') {
       const message = sanitizeText(payload.message);
       if (!message) return null;
