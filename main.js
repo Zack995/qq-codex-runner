@@ -41,6 +41,7 @@ const { enqueueMessage } = require('./src/commands');
 const {
   command,
   codexArgs,
+  codexModel,
   mode,
   weixinAccountId,
   weixinLoginForce,
@@ -52,6 +53,12 @@ setCodexBin(command);
 setCodexExtraArgs(codexArgs);
 
 async function startRunner() {
+  if (codexModel) {
+    runnerState.codexModel = codexModel;
+    persistRunnerStateNow();
+    log(`Using Codex model from startup args: ${codexModel}`);
+  }
+
   if (forceAccessMode) {
     if (!VALID_ACCESS_MODES.has(forceAccessMode)) {
       process.stderr.write(

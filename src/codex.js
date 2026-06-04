@@ -266,12 +266,16 @@ function buildApprovalPrompt(action, pendingApproval, options = {}) {
   return buildApprovalTurnPrompt(action, pendingApproval, options);
 }
 
-function buildCodexArgs(prompt, outputFile, session, workdir, accessMode) {
+function buildCodexArgs(prompt, outputFile, session, workdir, accessMode, codexModel) {
   const args = ['exec'];
   const mode = sanitizeText(accessMode).toLowerCase() || runnerState.accessMode;
   const accessConfig = VALID_ACCESS_MODES.get(mode) || VALID_ACCESS_MODES.get('safe');
+  const model = sanitizeText(codexModel) || sanitizeText(session && session.codexModel);
   args.push('-C', workdir);
   args.push('-s', accessConfig.sandbox);
+  if (model) {
+    args.push('--model', model);
+  }
   if (CODEX_CONTEXT_WINDOW_OVERRIDE) {
     args.push('-c', `model_context_window=${CODEX_CONTEXT_WINDOW_OVERRIDE}`);
   }
@@ -293,9 +297,9 @@ function buildCodexArgs(prompt, outputFile, session, workdir, accessMode) {
   return args;
 }
 
-function runCodexExec(prompt, session, workdir, context, run, accessMode) {
+function runCodexExec(prompt, session, workdir, context, run, accessMode, codexModel) {
   const outputFile = path.join(os.tmpdir(), `qq-codex-runner-last-${process.pid}-${Date.now()}.txt`);
-  const args = buildCodexArgs(prompt, outputFile, session, workdir, accessMode);
+  const args = buildCodexArgs(prompt, outputFile, session, workdir, accessMode, codexModel);
   const env = { ...process.env, TERM: process.env.TERM || 'xterm-256color' };
   if (RUNNER_CODEX_HOME) env.CODEX_HOME = RUNNER_CODEX_HOME;
 

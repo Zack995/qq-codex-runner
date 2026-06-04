@@ -34,7 +34,7 @@ function usage(exitCode = 1) {
 function parseArgs(argv) {
   const delimiterIndex = argv.indexOf('--');
   const runnerArgs = delimiterIndex === -1 ? argv : argv.slice(0, delimiterIndex);
-  const codexArgs = delimiterIndex === -1 ? [] : argv.slice(delimiterIndex + 1);
+  const rawCodexArgs = delimiterIndex === -1 ? [] : argv.slice(delimiterIndex + 1);
   let command = process.env.CODEX_BIN || 'codex';
   let mode = 'runner';
   let weixinAccountId = sanitizeText(process.env.WEIXIN_ACCOUNT_ID || 'default') || 'default';
@@ -92,7 +92,49 @@ function parseArgs(argv) {
     usage(1);
   }
 
-  return { command, codexArgs, mode, weixinAccountId, weixinLoginForce, weixinName, forceAccessMode };
+  const { codexArgs, codexModel } = extractCodexModelArg(rawCodexArgs);
+  return {
+    command,
+    codexArgs,
+    codexModel,
+    mode,
+    weixinAccountId,
+    weixinLoginForce,
+    weixinName,
+    forceAccessMode
+  };
+}
+
+function extractCodexModelArg(args) {
+  const codexArgs = [];
+  let codexModel = '';
+
+  for (let index = 0; index < args.length; index += 1) {
+    const token = String(args[index] || '');
+
+    if (token === '--model') {
+      const next = sanitizeText(args[index + 1]);
+      if (next) {
+        codexModel = next;
+        index += 1;
+        continue;
+      }
+      codexArgs.push(token);
+      continue;
+    }
+
+    if (token.startsWith('--model=')) {
+      const value = sanitizeText(token.slice('--model='.length));
+      if (value) {
+        codexModel = value;
+        continue;
+      }
+    }
+
+    codexArgs.push(token);
+  }
+
+  return { codexArgs, codexModel };
 }
 
 const INTENT_FLAGS = {
@@ -287,6 +329,7 @@ function loadRuntimeConfig() {
 module.exports = {
   usage,
   parseArgs,
+  extractCodexModelArg,
   INTENT_FLAGS,
   parseIntents,
   intentsToBitmask,

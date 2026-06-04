@@ -14,7 +14,8 @@ const {
   sessionIdentityForTask,
   queueDepthForSession,
   getActiveBackend,
-  getAccessModeForScope
+  getAccessModeForScope,
+  getCodexModelForScope
 } = require('./state');
 
 const { sendReply } = require('./exec');
@@ -36,9 +37,12 @@ async function executeTask(task, run) {
       : getActiveBackend(task.sessionScopeKey));
   const accessMode = sanitizeText(task.accessMode).toLowerCase()
     || getAccessModeForScope(task.sessionScopeKey);
+  const codexModel = backend === 'codex'
+    ? sanitizeText(task.codexModel) || getCodexModelForScope(task.sessionScopeKey)
+    : '';
   const session = (run && run.session)
-    || getScopedSession(task.sessionScopeKey, task.workdir, backend);
-  const sessionKey = sessionIdentityForTask({ ...task, backend });
+    || getScopedSession(task.sessionScopeKey, task.workdir, backend, codexModel);
+  const sessionKey = sessionIdentityForTask({ ...task, backend, codexModel });
   const pendingApprovalForSession = pendingApprovals.get(sessionKey) || null;
 
   const queueDepth = queueDepthForSession(sessionKey);
@@ -56,7 +60,7 @@ async function executeTask(task, run) {
 
     const reply = backend === 'claude'
       ? await runClaudeExec(prompt, session, task.workdir, task.context, run, accessMode)
-      : await runCodexExec(prompt, session, task.workdir, task.context, run, accessMode);
+      : await runCodexExec(prompt, session, task.workdir, task.context, run, accessMode, codexModel);
     if (!reply) {
       return;
     }
@@ -71,6 +75,7 @@ async function executeTask(task, run) {
         workdir: task.workdir,
         sessionScopeKey: task.sessionScopeKey,
         backend,
+        codexModel,
         accessMode
       });
       const approvalMessage = [
@@ -108,7 +113,10 @@ function tickQueues() {
 
 async function runTask(sessionKey, task) {
   const backend = task.backend || getActiveBackend(task.sessionScopeKey);
-  const session = getScopedSession(task.sessionScopeKey, task.workdir, backend);
+  const codexModel = backend === 'codex'
+    ? sanitizeText(task.codexModel) || getCodexModelForScope(task.sessionScopeKey)
+    : '';
+  const session = getScopedSession(task.sessionScopeKey, task.workdir, backend, codexModel);
   const run = {
     task,
     session,

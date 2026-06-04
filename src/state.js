@@ -239,7 +239,9 @@ function deriveInitialRunnerState(persistedState) {
     workdirs: {},
     accessMode: fallbackAccessMode,
     accessModes: {},
-    backends: {}
+    backends: {},
+    codexModel: '',
+    codexModels: {}
   };
 
   const persistedWorkdir = persistedState ? resolveExistingDirectory(persistedState.workdir) : null;
@@ -278,6 +280,22 @@ function deriveInitialRunnerState(persistedState) {
       const resolved = resolveExistingDirectory(workdir);
       if (!normalizedScope || !resolved) continue;
       nextState.workdirs[normalizedScope] = resolved;
+    }
+  }
+
+  const persistedCodexModel = sanitizeText(
+    (persistedState && (persistedState.codexModel || persistedState.codex_model)) || ''
+  );
+  if (persistedCodexModel) {
+    nextState.codexModel = persistedCodexModel;
+  }
+
+  if (persistedState && persistedState.codexModels && typeof persistedState.codexModels === 'object') {
+    for (const [scope, model] of Object.entries(persistedState.codexModels)) {
+      const normalizedScope = sanitizeText(scope);
+      const normalizedModel = sanitizeText(model);
+      if (!normalizedScope || !normalizedModel) continue;
+      nextState.codexModels[normalizedScope] = normalizedModel;
     }
   }
 
@@ -348,7 +366,9 @@ const runnerState = {
   accessMode: initialRunnerState.accessMode,
   accessModes: { ...(initialRunnerState.accessModes || {}) },
   addDirs: DEFAULT_ADD_DIRS.slice(),
-  backends: { ...(initialRunnerState.backends || {}) }
+  backends: { ...(initialRunnerState.backends || {}) },
+  codexModel: sanitizeText(initialRunnerState.codexModel),
+  codexModels: { ...(initialRunnerState.codexModels || {}) }
 };
 
 const weixinState = deriveInitialWeixinState(persistedRunnerState);
@@ -367,9 +387,11 @@ if (!VALID_ACCESS_MODES.has(runnerState.accessMode)) {
 
 // === Identity helpers ===
 
-function buildSessionIdentity(scopeKey, workdir, backend = 'codex') {
+function buildSessionIdentity(scopeKey, workdir, backend = 'codex', model = '') {
   const normalizedBackend = VALID_BACKENDS.has(backend) ? backend : 'codex';
-  return `${sanitizeText(scopeKey) || 'runner:default'}::${resolveInputPath(workdir)}::${normalizedBackend}`;
+  const normalizedModel = normalizedBackend === 'codex' ? sanitizeText(model) : '';
+  const modelSuffix = normalizedModel ? `::${normalizedModel}` : '';
+  return `${sanitizeText(scopeKey) || 'runner:default'}::${resolveInputPath(workdir)}::${normalizedBackend}${modelSuffix}`;
 }
 
 function getContextSessionScopeKey(context) {
@@ -390,14 +412,16 @@ function getContextSessionScopeKey(context) {
 function sessionIdentityForContext(context, backend) {
   const scopeKey = getContextSessionScopeKey(context);
   const resolvedBackend = backend || getActiveBackend(scopeKey);
-  return buildSessionIdentity(scopeKey, getWorkdirForScope(scopeKey), resolvedBackend);
+  const model = resolvedBackend === 'codex' ? getCodexModelForScope(scopeKey) : '';
+  return buildSessionIdentity(scopeKey, getWorkdirForScope(scopeKey), resolvedBackend, model);
 }
 
 function sessionIdentityForTask(task) {
   return buildSessionIdentity(
     task.sessionScopeKey,
     task.workdir,
-    task.backend || 'codex'
+    task.backend || 'codex',
+    (task.backend || 'codex') === 'codex' ? task.codexModel : ''
   );
 }
 
@@ -456,14 +480,36 @@ function setAccessModeForScope(scopeKey, mode) {
   runnerState.accessModes[key] = normalized;
 }
 
+function getCodexModelForScope(scopeKey) {
+  const key = sanitizeText(scopeKey);
+  if (key && runnerState.codexModels) {
+    const stored = sanitizeText(runnerState.codexModels[key]);
+    if (stored) return stored;
+  }
+  return sanitizeText(runnerState.codexModel);
+}
+
+function setCodexModelForScope(scopeKey, model) {
+  const key = sanitizeText(scopeKey);
+  const normalized = sanitizeText(model);
+  if (!key) return;
+  if (!runnerState.codexModels) runnerState.codexModels = {};
+  if (!normalized) {
+    delete runnerState.codexModels[key];
+    return;
+  }
+  runnerState.codexModels[key] = normalized;
+}
+
 // === Sessions ===
 
-function createCodexSessionState(scopeKey, workdir, backend = 'codex') {
+function createCodexSessionState(scopeKey, workdir, backend = 'codex', codexModel = '') {
   const normalizedBackend = VALID_BACKENDS.has(backend) ? backend : 'codex';
   return {
     scopeKey,
     workdir: resolveInputPath(workdir),
     backend: normalizedBackend,
+    codexModel: normalizedBackend === 'codex' ? sanitizeText(codexModel) : '',
     hasConversation: false,
     threadId: null,
     generation: 0,
@@ -472,20 +518,26 @@ function createCodexSessionState(scopeKey, workdir, backend = 'codex') {
   };
 }
 
-function getScopedSession(scopeKey, workdir = runnerState.workdir, backend) {
+function getScopedSession(scopeKey, workdir = runnerState.workdir, backend, codexModel) {
   const resolvedWorkdir = resolveInputPath(workdir);
   const resolvedBackend = VALID_BACKENDS.has(backend) ? backend : getActiveBackend(scopeKey);
-  const key = buildSessionIdentity(scopeKey, resolvedWorkdir, resolvedBackend);
+  const resolvedModel = resolvedBackend === 'codex'
+    ? sanitizeText(codexModel) || getCodexModelForScope(scopeKey)
+    : '';
+  const key = buildSessionIdentity(scopeKey, resolvedWorkdir, resolvedBackend, resolvedModel);
   if (!codexSessions.has(key)) {
-    codexSessions.set(key, createCodexSessionState(scopeKey, resolvedWorkdir, resolvedBackend));
+    codexSessions.set(
+      key,
+      createCodexSessionState(scopeKey, resolvedWorkdir, resolvedBackend, resolvedModel)
+    );
   }
   return codexSessions.get(key);
 }
 
-function getSessionForContext(context, workdir, backend) {
+function getSessionForContext(context, workdir, backend, codexModel) {
   const scopeKey = getContextSessionScopeKey(context);
   const resolvedWorkdir = workdir || getWorkdirForScope(scopeKey);
-  return getScopedSession(scopeKey, resolvedWorkdir, backend);
+  return getScopedSession(scopeKey, resolvedWorkdir, backend, codexModel);
 }
 
 function hydratePersistedCodexSessions(persistedState) {
@@ -501,8 +553,11 @@ function hydratePersistedCodexSessions(persistedState) {
 
     const rawBackend = sanitizeText(record.backend).toLowerCase();
     const backend = VALID_BACKENDS.has(rawBackend) ? rawBackend : 'codex';
+    const codexModel = backend === 'codex'
+      ? sanitizeText(record.codexModel || record.codex_model)
+      : '';
 
-    const key = buildSessionIdentity(scopeKey, resolvedWorkdir, backend);
+    const key = buildSessionIdentity(scopeKey, resolvedWorkdir, backend, codexModel);
     const persistedLastTokenUsage = normalizeTokenUsage(record.lastTokenUsage || record.last_token_usage);
     const persistedTotalTokenUsage = normalizeTokenUsage(record.totalTokenUsage || record.total_token_usage);
     const hydratedTokenUsage = (!persistedLastTokenUsage && !persistedTotalTokenUsage && backend === 'codex')
@@ -512,6 +567,7 @@ function hydratePersistedCodexSessions(persistedState) {
       scopeKey,
       workdir: resolvedWorkdir,
       backend,
+      codexModel,
       hasConversation: true,
       threadId,
       generation: 0,
@@ -691,6 +747,7 @@ function buildPersistedRunnerState() {
         scopeKey: session.scopeKey,
         workdir: session.workdir,
         backend: session.backend || 'codex',
+        codexModel: sanitizeText(session.codexModel),
         threadId: session.threadId,
         lastTokenUsage: normalizeTokenUsage(session.lastTokenUsage),
         totalTokenUsage: normalizeTokenUsage(session.totalTokenUsage),
@@ -702,6 +759,9 @@ function buildPersistedRunnerState() {
   sessionRecords.sort((left, right) => {
     if (left.scopeKey === right.scopeKey) {
       if (left.workdir === right.workdir) {
+        if (String(left.backend) === String(right.backend)) {
+          return String(left.codexModel || '').localeCompare(String(right.codexModel || ''));
+        }
         return String(left.backend).localeCompare(String(right.backend));
       }
       return left.workdir.localeCompare(right.workdir);
@@ -735,13 +795,23 @@ function buildPersistedRunnerState() {
     }
   }
 
+  const sortedCodexModels = {};
+  if (runnerState.codexModels && typeof runnerState.codexModels === 'object') {
+    for (const scope of Object.keys(runnerState.codexModels).sort()) {
+      const value = sanitizeText(runnerState.codexModels[scope]);
+      if (value) sortedCodexModels[scope] = value;
+    }
+  }
+
   return {
-    version: 4,
+    version: 5,
     workdir: runnerState.workdir,
     workdirs: sortedWorkdirs,
     accessMode: runnerState.accessMode,
     accessModes: sortedAccessModes,
     backends: sortedBackends,
+    codexModel: sanitizeText(runnerState.codexModel),
+    codexModels: sortedCodexModels,
     codexSessions: sessionRecords,
     weixin: {
       syncCursors: { ...(weixinState.syncCursors || {}) },
@@ -867,6 +937,8 @@ module.exports = {
   setWorkdirForScope,
   getAccessModeForScope,
   setAccessModeForScope,
+  getCodexModelForScope,
+  setCodexModelForScope,
   // sessions
   createCodexSessionState,
   getScopedSession,

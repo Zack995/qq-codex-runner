@@ -246,6 +246,16 @@ node main.js --weixin-logout --weixin-account default
   选择最近一次搜索结果
 - `/access <read|write|safe|full>`
   切换权限模式并清空队列；现有会话保留，下一条消息以新权限继续（同时影响 codex sandbox 与 claude permission-mode）
+- `/model`
+  查看当前聊天和全局默认的 Codex 模型配置
+- `/model <模型名>`
+  切换当前聊天的 Codex 模型（仅对 Codex 生效；不同模型会进入各自独立会话）
+- `/model clear`
+  清除当前聊天的 Codex 模型覆盖，回退到全局默认或 Codex CLI 默认模型
+- `/model global <模型名>`
+  设置全局默认 Codex 模型
+- `/model global clear`
+  清除全局默认 Codex 模型，回退到 Codex CLI 默认模型
 - `/backend`
   查看当前聊天的后端，并检测 codex / claude 两个 CLI 的可用性
 - `/backend <codex|claude>`
@@ -265,7 +275,7 @@ node main.js --weixin-logout --weixin-account default
 
 - 同一工作目录下，QQ、微信和手动终端里的 `codex` / `claude` 默认彼此隔离
 - 同时支持多 QQ 机器人和多微信账号；每条消息带着来源 bot/account 进入队列，回复也由对应 client 发出，不会串号
-- **每个会话（bot/account + 对话对象 + 工作目录 + 后端）独立队列 + 独立执行槽**，互不阻塞；全局并发上限由 `RUNNER_MAX_CONCURRENCY`（默认 3）控制
+- **每个会话（bot/account + 对话对象 + 工作目录 + 后端；Codex 还会额外按 model 隔离）独立队列 + 独立执行槽**，互不阻塞；全局并发上限由 `RUNNER_MAX_CONCURRENCY`（默认 3）控制
 - 同一会话内仍然串行，保留 threadId / session_id 的连续性
 - 升级后启动时，若检测到老格式会话（`qq:channel:X` 无 botId）且只配了一个 QQ 机器人，自动迁移到该 `id` 下；配了多个则丢弃老会话并在日志提示
 - Codex 走 `codex exec --json`，复用 `threadId`；Claude 走 `claude -p --output-format stream-json --verbose`，复用 `session_id`
@@ -275,6 +285,7 @@ node main.js --weixin-logout --weixin-account default
 - 最终仍只回一次正式答复，避免把中间过程和最终结论混在一起
 - `/access` 切换权限模式是**热切**：已在跑的任务保持旧权限跑完；队列中未开始的任务以及下一条消息以新权限启动；会话保留
 - `/cwd` 切目录也是**热切**：已在跑的任务按原目录跑完；队列中未开始的任务仍以原目录跑；新消息走新目录。切回旧目录会恢复该目录旧会话
+- `/model` 切 Codex 模型也是**热切**：已在跑的任务保持原模型跑完；队列中已入队任务保持入队时模型；新消息走新模型。切回旧模型会恢复该模型旧会话
 - `/new` 只影响当前聊天（同 scope + workdir + backend）的会话 / 队列 / 待审批；不影响其他 bot / 用户
 - `/restart` 是全局核武：停止所有任务、清空所有队列、重置所有会话
 - Claude Code 的权限走 `--permission-mode`，无 Codex 的 `<approval_request>` 交互审批流程；`/allow` `/skip` `/reject` 仅对 Codex 生效
@@ -298,12 +309,14 @@ cat logs/runner-state.json
 
 ## 额外说明
 
-- `.env`、日志和 PID 文件默认不会进入 Git
-- 如需给 `codex` 额外传参，可以用：
+- `.env*`、日志和 PID 文件默认不会进入 Git；`.env.example` 会保留在 Git 中
+- 如需设置启动默认 Codex 模型，可以用：
 
 ```bash
 node main.js -- --model gpt-5.4
 ```
+
+该模型会写入 runner 状态，之后仍可用 `/model` 或 `/model global` 在聊天里热切换。
 
 - 如需指定 `codex` 可执行路径，可以用：
 

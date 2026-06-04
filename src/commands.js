@@ -62,6 +62,8 @@ const {
   setWorkdirForScope,
   getAccessModeForScope,
   setAccessModeForScope,
+  getCodexModelForScope,
+  setCodexModelForScope,
   getScopedSession,
   getSessionForContext,
   countActiveSessions,
@@ -364,10 +366,16 @@ function getHelpMessage() {
     '/access - 查看当前权限模式',
     '/access <read|write|safe|full> - 热切权限模式（对新任务生效）',
     '',
+    '/model - 查看 Codex 模型配置',
+    '/model <模型名> - 切换当前聊天的 Codex 模型（仅对 Codex 生效）',
+    '/model global <模型名> - 设置全局默认 Codex 模型',
+    '/model clear - 清除当前聊天的 Codex 模型覆盖',
+    '/model global clear - 清除全局默认 Codex 模型',
+    '',
     '/backend - 查看当前后端 + 检测 codex / claude 可用性',
     '/backend <codex|claude> - 切换当前聊天的后端（按聊天独立生效）',
     '',
-    '/new - 重置当前会话（仅影响当前 bot/用户/目录/后端）',
+    '/new - 重置当前会话（仅影响当前 bot/用户/目录/后端；Codex 还按当前模型区分）',
     '/restart - 停止所有任务、清空所有队列、重置所有会话',
     '',
     '/allow /skip /reject - 审批待确认命令（仅 Codex）'
@@ -387,7 +395,8 @@ function getStatusMessage(context) {
   const backend = getActiveBackend(scopeKey);
   const scopeWorkdir = getWorkdirForScope(scopeKey);
   const scopeAccessMode = getAccessModeForScope(scopeKey);
-  const currentSession = getSessionForContext(context, scopeWorkdir, backend);
+  const codexModel = backend === 'codex' ? getCodexModelForScope(scopeKey) : '';
+  const currentSession = getSessionForContext(context, scopeWorkdir, backend, codexModel);
   const tokenUsage = ensureSessionTokenUsage(currentSession);
   const qqEntries = Array.from(qqBots.values()).map((b) => ({ id: b.id, name: b.name, ready: b.ready }));
   const weixinEntries = Array.from(weixinBots.values()).map((b) => ({ id: b.accountId, name: b.name, ready: b.ready }));
@@ -423,6 +432,7 @@ function getStatusMessage(context) {
     const autoCompactTokenLimit = getEffectiveCodexAutoCompactTokenLimit();
     lines.push(
       `Runner CODEX_HOME：${RUNNER_CODEX_HOME || '继承系统默认'}`,
+      `Codex 模型：${codexModel || '未设置（使用 Codex CLI 默认模型）'}`,
       `Codex 上下文窗口：${formatCodexConfigValue(contextWindow, {
         overridden: Boolean(CODEX_CONTEXT_WINDOW_OVERRIDE)
       })}`,
@@ -480,7 +490,8 @@ function getSessionMessage(context) {
   const backend = getActiveBackend(scopeKey);
   const scopeWorkdir = getWorkdirForScope(scopeKey);
   const scopeAccessMode = getAccessModeForScope(scopeKey);
-  const currentSession = getSessionForContext(context, scopeWorkdir, backend);
+  const codexModel = backend === 'codex' ? getCodexModelForScope(scopeKey) : '';
+  const currentSession = getSessionForContext(context, scopeWorkdir, backend, codexModel);
   const tokenUsage = ensureSessionTokenUsage(currentSession);
   const threadLabel = backend === 'claude' ? 'Session ID' : '线程 ID';
   const callerSessionKey = sessionIdentityForContext(context, backend);
@@ -507,6 +518,7 @@ function getSessionMessage(context) {
     const autoCompactTokenLimit = getEffectiveCodexAutoCompactTokenLimit();
     lines.push(
       `Runner CODEX_HOME：${RUNNER_CODEX_HOME || '继承系统默认'}`,
+      `Codex 模型：${codexModel || '未设置（使用 Codex CLI 默认模型）'}`,
       `Codex 自动压缩阈值：${formatCodexConfigValue(autoCompactTokenLimit, {
         overridden: Boolean(CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE)
       })}`
@@ -560,6 +572,26 @@ function getAccessMessage(context) {
     lines.push(`全局默认：${VALID_ACCESS_MODES.get(runnerState.accessMode).label}`);
   }
   lines.push('可选模式：read / write / safe / full');
+  return lines.join('\n');
+}
+
+function getCodexModelMessage(context) {
+  const scopeKey = context ? getContextSessionScopeKey(context) : '';
+  const scopeModel = scopeKey ? getCodexModelForScope(scopeKey) : sanitizeText(runnerState.codexModel);
+  const currentBackend = scopeKey ? getActiveBackend(scopeKey) : 'codex';
+  const lines = [
+    'Codex 模型：',
+    `当前聊天：${scopeModel || '未设置（使用 Codex CLI 默认模型）'}`
+  ];
+  if (scopeModel !== sanitizeText(runnerState.codexModel)) {
+    lines.push(`全局默认：${sanitizeText(runnerState.codexModel) || '未设置（使用 Codex CLI 默认模型）'}`);
+  }
+  lines.push(
+    currentBackend === 'codex'
+      ? '说明：当前聊天切模型后会进入对应模型的独立 Codex 会话。'
+      : '说明：当前聊天当前后端不是 Codex；模型配置会在切回 Codex 时生效。'
+  );
+  lines.push('用法：/model <模型名> | /model clear | /model global <模型名> | /model global clear');
   return lines.join('\n');
 }
 
@@ -661,8 +693,15 @@ setSendReplyImpl(safeSendReply);
 
 async function resetCodexSession(context) {
   const scopeKey = getContextSessionScopeKey(context);
-  const session = getSessionForContext(context);
-  const sessionKey = buildSessionIdentity(session.scopeKey, session.workdir, session.backend);
+  const backend = getActiveBackend(scopeKey);
+  const codexModel = backend === 'codex' ? getCodexModelForScope(scopeKey) : '';
+  const session = getSessionForContext(context, undefined, backend, codexModel);
+  const sessionKey = buildSessionIdentity(
+    session.scopeKey,
+    session.workdir,
+    session.backend,
+    session.backend === 'codex' ? session.codexModel : ''
+  );
   resetSessionState(session);
   pendingApprovals.delete(sessionKey);
   clearQueueForSession(sessionKey);
@@ -792,7 +831,8 @@ async function handleBackendCommand(context, rawArg) {
   setActiveBackend(scopeKey, normalized);
   persistRunnerState();
   const suffix = check.warn ? `\n注意：${check.message}` : '';
-  const nextSession = getScopedSession(scopeKey, getWorkdirForScope(scopeKey), normalized);
+  const nextCodexModel = normalized === 'codex' ? getCodexModelForScope(scopeKey) : '';
+  const nextSession = getScopedSession(scopeKey, getWorkdirForScope(scopeKey), normalized, nextCodexModel);
   const sessionHint = nextSession.hasConversation
     ? `已恢复该后端之前的会话（线程 ${nextSession.threadId || '未知'}）。`
     : '这是该后端的首次会话，下一条消息会新开对话。';
@@ -827,6 +867,75 @@ async function switchAccessMode(context, rawMode) {
   await safeSendReply(
     context,
     `当前聊天的权限模式已热切换为：${VALID_ACCESS_MODES.get(mode).label}\n已在跑的任务保持旧权限跑完；排队中的任务和下一条消息会以新权限启动；其他聊天不受影响。`
+  );
+}
+
+async function handleModelCommand(context, rawArg) {
+  const input = sanitizeText(rawArg);
+  if (!input) {
+    await safeSendReply(context, getCodexModelMessage(context));
+    return;
+  }
+
+  const scopeKey = getContextSessionScopeKey(context);
+  const parts = input.split(/\s+/).filter(Boolean);
+
+  if (parts[0] === 'global') {
+    const globalValue = sanitizeText(parts.slice(1).join(' '));
+    if (!globalValue) {
+      await safeSendReply(
+        context,
+        `全局默认 Codex 模型：${sanitizeText(runnerState.codexModel) || '未设置（使用 Codex CLI 默认模型）'}`
+      );
+      return;
+    }
+
+    if (globalValue.toLowerCase() === 'clear') {
+      runnerState.codexModel = '';
+      persistRunnerState();
+      await safeSendReply(
+        context,
+        '已清除全局默认 Codex 模型；未设置当前聊天覆盖的聊天会回退到 Codex CLI 默认模型。'
+      );
+      return;
+    }
+
+    runnerState.codexModel = globalValue;
+    persistRunnerState();
+    await safeSendReply(
+      context,
+      `已将全局默认 Codex 模型设置为：${globalValue}\n已在跑的任务保持原模型跑完；其他未设置聊天覆盖的聊天，下一条消息会使用新模型。`
+    );
+    return;
+  }
+
+  if (input.toLowerCase() === 'clear') {
+    const previous = getCodexModelForScope(scopeKey);
+    setCodexModelForScope(scopeKey, '');
+    persistRunnerState();
+    const fallback = sanitizeText(runnerState.codexModel) || 'Codex CLI 默认模型';
+    await safeSendReply(
+      context,
+      previous
+        ? `已清除当前聊天的 Codex 模型覆盖；下一条消息会回退到 ${fallback}。`
+        : `当前聊天本来就没有 Codex 模型覆盖；仍会使用 ${fallback}。`
+    );
+    return;
+  }
+
+  setCodexModelForScope(scopeKey, input);
+  persistRunnerState();
+  const backend = getActiveBackend(scopeKey);
+  const session = getScopedSession(scopeKey, getWorkdirForScope(scopeKey), 'codex', input);
+  const sessionHint = session.hasConversation
+    ? `已恢复该模型之前的会话（线程 ${session.threadId || '未知'}）。`
+    : '这是该模型的首次会话，下一条消息会新开对话。';
+  const backendHint = backend === 'codex'
+    ? '新消息会直接按这个模型进入独立 Codex 会话。'
+    : '当前后端不是 Codex；切回 Codex 后会使用这个模型。';
+  await safeSendReply(
+    context,
+    `已将当前聊天的 Codex 模型设置为：${input}\n${sessionHint}\n${backendHint}`
   );
 }
 
@@ -887,6 +996,11 @@ async function enqueueMessage(eventType, message, source = {}) {
     return;
   }
 
+  if (commandWord === '/model') {
+    await handleModelCommand(context, commandArg);
+    return;
+  }
+
   if (commandWord === '/backend') {
     await handleBackendCommand(context, commandArg);
     return;
@@ -929,6 +1043,7 @@ async function enqueueMessage(eventType, message, source = {}) {
       workdir: scopedApproval.workdir,
       sessionScopeKey: scopedApproval.sessionScopeKey,
       backend: scopedApproval.backend || 'codex',
+      codexModel: scopedApproval.codexModel || getCodexModelForScope(scopedApproval.sessionScopeKey),
       accessMode: scopedApproval.accessMode
         || getAccessModeForScope(scopedApproval.sessionScopeKey)
     };
@@ -961,6 +1076,7 @@ async function enqueueMessage(eventType, message, source = {}) {
     workdir: getWorkdirForScope(context.sessionScopeKey),
     sessionScopeKey: context.sessionScopeKey,
     backend: getActiveBackend(context.sessionScopeKey),
+    codexModel: getCodexModelForScope(context.sessionScopeKey),
     accessMode: getAccessModeForScope(context.sessionScopeKey)
   };
   const taskSessionKey = sessionIdentityForTask(task);
