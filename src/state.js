@@ -241,7 +241,8 @@ function deriveInitialRunnerState(persistedState) {
     accessModes: {},
     backends: {},
     codexModel: '',
-    codexModels: {}
+    codexModels: {},
+    goals: {}
   };
 
   const persistedWorkdir = persistedState ? resolveExistingDirectory(persistedState.workdir) : null;
@@ -296,6 +297,15 @@ function deriveInitialRunnerState(persistedState) {
       const normalizedModel = sanitizeText(model);
       if (!normalizedScope || !normalizedModel) continue;
       nextState.codexModels[normalizedScope] = normalizedModel;
+    }
+  }
+
+  if (persistedState && persistedState.goals && typeof persistedState.goals === 'object') {
+    for (const [scope, goal] of Object.entries(persistedState.goals)) {
+      const normalizedScope = sanitizeText(scope);
+      const normalizedGoal = sanitizeText(goal);
+      if (!normalizedScope || !normalizedGoal) continue;
+      nextState.goals[normalizedScope] = normalizedGoal;
     }
   }
 
@@ -368,7 +378,8 @@ const runnerState = {
   addDirs: DEFAULT_ADD_DIRS.slice(),
   backends: { ...(initialRunnerState.backends || {}) },
   codexModel: sanitizeText(initialRunnerState.codexModel),
-  codexModels: { ...(initialRunnerState.codexModels || {}) }
+  codexModels: { ...(initialRunnerState.codexModels || {}) },
+  goals: { ...(initialRunnerState.goals || {}) }
 };
 
 const weixinState = deriveInitialWeixinState(persistedRunnerState);
@@ -499,6 +510,24 @@ function setCodexModelForScope(scopeKey, model) {
     return;
   }
   runnerState.codexModels[key] = normalized;
+}
+
+function getGoalForScope(scopeKey) {
+  const key = sanitizeText(scopeKey);
+  if (!key || !runnerState.goals) return '';
+  return sanitizeText(runnerState.goals[key]);
+}
+
+function setGoalForScope(scopeKey, goal) {
+  const key = sanitizeText(scopeKey);
+  const normalized = sanitizeText(goal);
+  if (!key) return;
+  if (!runnerState.goals) runnerState.goals = {};
+  if (!normalized) {
+    delete runnerState.goals[key];
+    return;
+  }
+  runnerState.goals[key] = normalized;
 }
 
 // === Sessions ===
@@ -803,8 +832,16 @@ function buildPersistedRunnerState() {
     }
   }
 
+  const sortedGoals = {};
+  if (runnerState.goals && typeof runnerState.goals === 'object') {
+    for (const scope of Object.keys(runnerState.goals).sort()) {
+      const value = sanitizeText(runnerState.goals[scope]);
+      if (value) sortedGoals[scope] = value;
+    }
+  }
+
   return {
-    version: 5,
+    version: 6,
     workdir: runnerState.workdir,
     workdirs: sortedWorkdirs,
     accessMode: runnerState.accessMode,
@@ -812,6 +849,7 @@ function buildPersistedRunnerState() {
     backends: sortedBackends,
     codexModel: sanitizeText(runnerState.codexModel),
     codexModels: sortedCodexModels,
+    goals: sortedGoals,
     codexSessions: sessionRecords,
     weixin: {
       syncCursors: { ...(weixinState.syncCursors || {}) },
@@ -939,6 +977,8 @@ module.exports = {
   setAccessModeForScope,
   getCodexModelForScope,
   setCodexModelForScope,
+  getGoalForScope,
+  setGoalForScope,
   // sessions
   createCodexSessionState,
   getScopedSession,

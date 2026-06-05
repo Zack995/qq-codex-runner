@@ -220,9 +220,13 @@ function buildChatTurnPrompt(input, options = {}) {
   const includePolicy = options.includePolicy !== false;
   const backend = options.backend || 'codex';
   const accessMode = options.accessMode;
+  const goal = sanitizeText(options.goal);
   const parts = [];
   if (includePolicy && backend === 'codex') {
     parts.push(buildAgentPolicyPrompt(accessMode), '');
+  }
+  if (goal) {
+    parts.push(`[Current goal]\n${goal}\n[/Current goal]`, '');
   }
   parts.push(`[User message]\n${input}\n[/User message]`);
   return parts.join('\n');
@@ -231,9 +235,13 @@ function buildChatTurnPrompt(input, options = {}) {
 function buildApprovalTurnPrompt(action, approval, options = {}) {
   const includePolicy = options.includePolicy !== false;
   const accessMode = options.accessMode;
+  const goal = sanitizeText(options.goal);
   const parts = [];
   if (includePolicy) {
     parts.push(buildAgentPolicyPrompt(accessMode), '');
+  }
+  if (goal) {
+    parts.push(`[Current goal]\n${goal}\n[/Current goal]`, '');
   }
 
   if (!approval) {
@@ -264,6 +272,19 @@ function buildUserPrompt(input, options = {}) {
 
 function buildApprovalPrompt(action, pendingApproval, options = {}) {
   return buildApprovalTurnPrompt(action, pendingApproval, options);
+}
+
+function buildReviewPrompt(instructions, options = {}) {
+  const goal = sanitizeText(options.goal);
+  const normalizedInstructions = sanitizeText(instructions);
+  const parts = [];
+  if (goal) {
+    parts.push(`[Current goal]\n${goal}\n[/Current goal]`);
+  }
+  if (normalizedInstructions) {
+    parts.push(`[Review instructions]\n${normalizedInstructions}\n[/Review instructions]`);
+  }
+  return parts.join('\n\n');
 }
 
 function buildCodexArgs(prompt, outputFile, session, workdir, accessMode, codexModel) {
@@ -344,6 +365,77 @@ function runCodexExec(prompt, session, workdir, context, run, accessMode, codexM
   });
 }
 
+function buildCodexReviewArgs(prompt, outputFile, session, accessMode, codexModel, reviewArgs = []) {
+  const args = ['exec', 'review'];
+  const mode = sanitizeText(accessMode).toLowerCase() || runnerState.accessMode;
+  const accessConfig = VALID_ACCESS_MODES.get(mode) || VALID_ACCESS_MODES.get('safe');
+  const model = sanitizeText(codexModel) || sanitizeText(session && session.codexModel);
+  if (model) {
+    args.push('--model', model);
+  }
+  if (CODEX_CONTEXT_WINDOW_OVERRIDE) {
+    args.push('-c', `model_context_window=${CODEX_CONTEXT_WINDOW_OVERRIDE}`);
+  }
+  if (CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE) {
+    args.push('-c', `model_auto_compact_token_limit=${CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE}`);
+  }
+  if (accessConfig.bypass) {
+    args.push('--dangerously-bypass-approvals-and-sandbox');
+  }
+  args.push('--skip-git-repo-check', '--json', '--output-last-message', outputFile);
+  if (Array.isArray(reviewArgs) && reviewArgs.length > 0) {
+    args.push(...reviewArgs);
+  }
+  if (sanitizeText(prompt)) {
+    args.push(prompt);
+  }
+  return args;
+}
+
+function runCodexReviewExec(prompt, session, workdir, context, run, accessMode, codexModel, reviewArgs) {
+  const outputFile = path.join(os.tmpdir(), `qq-codex-runner-review-${process.pid}-${Date.now()}.txt`);
+  const args = buildCodexReviewArgs(prompt, outputFile, session, accessMode, codexModel, reviewArgs);
+  const env = { ...process.env, TERM: process.env.TERM || 'xterm-256color' };
+  if (RUNNER_CODEX_HOME) env.CODEX_HOME = RUNNER_CODEX_HOME;
+
+  return runAgentChildProcess({
+    bin: codexBin,
+    args,
+    cwd: workdir,
+    env,
+    session,
+    run,
+    context,
+    parseEvent: extractProgressUpdateFromExecEvent,
+    timeoutLabel: 'Codex review',
+    onSuccess: async ({ code, stdout, stderr, events }) => {
+      let finalMessage = '';
+      try { finalMessage = fs.readFileSync(outputFile, 'utf8'); } catch (_) {}
+      try { fs.unlinkSync(outputFile); } catch (_) {}
+
+      if (code !== 0) {
+        const hint = describeBackendRuntimeError('codex', stderr, stdout);
+        return { error: new Error(summarizeExecFailure(stderr, stdout) + hint) };
+      }
+
+      const tokenUsage = extractTokenUsageFromExecEvents(events);
+      if (tokenUsage.lastUsage) session.lastTokenUsage = tokenUsage.lastUsage;
+      if (tokenUsage.totalUsage) {
+        session.totalTokenUsage = tokenUsage.totalUsage;
+      } else if (tokenUsage.lastUsage) {
+        session.totalTokenUsage = addTokenUsage(session.totalTokenUsage, tokenUsage.lastUsage);
+      }
+      if (events.length > 0 || sanitizeText(finalMessage)) {
+        persistRunnerState();
+      }
+
+      const normalized = sanitizeText(finalMessage);
+      if (!normalized) return { error: new Error('Codex review finished without a final reply.') };
+      return { reply: normalized };
+    }
+  });
+}
+
 module.exports = {
   setCodexBin,
   setCodexExtraArgs,
@@ -359,6 +451,9 @@ module.exports = {
   buildApprovalTurnPrompt,
   buildUserPrompt,
   buildApprovalPrompt,
+  buildReviewPrompt,
   buildCodexArgs,
-  runCodexExec
+  runCodexExec,
+  buildCodexReviewArgs,
+  runCodexReviewExec
 };

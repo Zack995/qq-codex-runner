@@ -64,6 +64,8 @@ const {
   setAccessModeForScope,
   getCodexModelForScope,
   setCodexModelForScope,
+  getGoalForScope,
+  setGoalForScope,
   getScopedSession,
   getSessionForContext,
   countActiveSessions,
@@ -372,6 +374,15 @@ function getHelpMessage() {
     '/model clear - 清除当前聊天的 Codex 模型覆盖',
     '/model global clear - 清除全局默认 Codex 模型',
     '',
+    '/目标 - 查看当前聊天目标',
+    '/目标 <内容> - 设置当前聊天目标（会带入后续任务和代码审查）',
+    '/目标 clear|清除 - 清除当前聊天目标',
+    '',
+    '/代码审查 - 使用 Codex 原生 review 审查未提交改动',
+    '/代码审查 --base <分支> - 审查相对指定分支的改动',
+    '/代码审查 --commit <SHA> - 审查指定提交',
+    '/代码审查 -- <说明> - 附加审查说明',
+    '',
     '/backend - 查看当前后端 + 检测 codex / claude 可用性',
     '/backend <codex|claude> - 切换当前聊天的后端（按聊天独立生效）',
     '',
@@ -396,6 +407,7 @@ function getStatusMessage(context) {
   const scopeWorkdir = getWorkdirForScope(scopeKey);
   const scopeAccessMode = getAccessModeForScope(scopeKey);
   const codexModel = backend === 'codex' ? getCodexModelForScope(scopeKey) : '';
+  const goal = getGoalForScope(scopeKey);
   const currentSession = getSessionForContext(context, scopeWorkdir, backend, codexModel);
   const tokenUsage = ensureSessionTokenUsage(currentSession);
   const qqEntries = Array.from(qqBots.values()).map((b) => ({ id: b.id, name: b.name, ready: b.ready }));
@@ -424,6 +436,7 @@ function getStatusMessage(context) {
     `已缓存目录会话：${countActiveSessions()}`,
     `存在待审批（当前聊天）：${callerPending ? '是' : '否'}`,
     `工作目录：${scopeWorkdir}`,
+    `当前目标：${goal || '未设置'}`,
     `权限模式：${VALID_ACCESS_MODES.get(scopeAccessMode).label}（全局默认：${VALID_ACCESS_MODES.get(runnerState.accessMode).label}）`
   ];
 
@@ -469,7 +482,11 @@ function getQueueMessage() {
     lines.push('正在执行：');
     for (const run of activeRuns.values()) {
       const backendLabel = BACKEND_LABELS[run.backend] || run.backend;
-      const taskKind = run.task && run.task.kind === 'approval' ? '审批任务' : '普通任务';
+      const taskKind = run.task && run.task.kind === 'approval'
+        ? '审批任务'
+        : run.task && run.task.kind === 'review'
+          ? '代码审查任务'
+          : '普通任务';
       lines.push(`  · ${run.session.scopeKey} [${backendLabel}] ${taskKind}`);
     }
   }
@@ -491,6 +508,7 @@ function getSessionMessage(context) {
   const scopeWorkdir = getWorkdirForScope(scopeKey);
   const scopeAccessMode = getAccessModeForScope(scopeKey);
   const codexModel = backend === 'codex' ? getCodexModelForScope(scopeKey) : '';
+  const goal = getGoalForScope(scopeKey);
   const currentSession = getSessionForContext(context, scopeWorkdir, backend, codexModel);
   const tokenUsage = ensureSessionTokenUsage(currentSession);
   const threadLabel = backend === 'claude' ? 'Session ID' : '线程 ID';
@@ -511,6 +529,7 @@ function getSessionMessage(context) {
     `已缓存目录会话：${countActiveSessions()}`,
     `存在待审批（当前聊天）：${callerPending ? '是' : '否'}`,
     `工作目录：${scopeWorkdir}`,
+    `当前目标：${goal || '未设置'}`,
     `权限模式：${VALID_ACCESS_MODES.get(scopeAccessMode).label}`
   ];
 
@@ -593,6 +612,17 @@ function getCodexModelMessage(context) {
   );
   lines.push('用法：/model <模型名> | /model clear | /model global <模型名> | /model global clear');
   return lines.join('\n');
+}
+
+function getGoalMessage(context) {
+  const scopeKey = context ? getContextSessionScopeKey(context) : '';
+  const goal = getGoalForScope(scopeKey);
+  return [
+    '当前目标：',
+    goal || '未设置',
+    '',
+    '用法：/目标 <内容> 或 /目标 clear'
+  ].join('\n');
 }
 
 function buildContext(eventType, message, source = {}) {
@@ -939,6 +969,247 @@ async function handleModelCommand(context, rawArg) {
   );
 }
 
+async function handleGoalCommand(context, rawArg) {
+  const input = sanitizeText(rawArg);
+  const scopeKey = getContextSessionScopeKey(context);
+  if (!input) {
+    await safeSendReply(context, getGoalMessage(context));
+    return;
+  }
+
+  if (input.toLowerCase() === 'clear' || input === '清除') {
+    const previous = getGoalForScope(scopeKey);
+    setGoalForScope(scopeKey, '');
+    persistRunnerState();
+    await safeSendReply(
+      context,
+      previous ? '已清除当前聊天目标。' : '当前聊天本来就没有设置目标。'
+    );
+    return;
+  }
+
+  setGoalForScope(scopeKey, input);
+  persistRunnerState();
+  await safeSendReply(context, `已设置当前聊天目标：\n${input}`);
+}
+
+function splitCommandTokens(rawArg) {
+  const input = sanitizeText(rawArg);
+  const tokens = [];
+  let current = '';
+  let quote = '';
+  let tokenStarted = false;
+
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+
+    if (char === '\\') {
+      if (index + 1 < input.length) {
+        current += input[index + 1];
+        tokenStarted = true;
+        index += 1;
+        continue;
+      }
+      current += char;
+      tokenStarted = true;
+      continue;
+    }
+
+    if (quote) {
+      if (char === quote) {
+        quote = '';
+      } else {
+        current += char;
+      }
+      tokenStarted = true;
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      quote = char;
+      tokenStarted = true;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      if (tokenStarted) {
+        tokens.push(current);
+        current = '';
+        tokenStarted = false;
+      }
+      continue;
+    }
+
+    current += char;
+    tokenStarted = true;
+  }
+
+  if (quote) {
+    return { error: '参数引号未闭合。' };
+  }
+  if (tokenStarted) {
+    tokens.push(current);
+  }
+  return { tokens };
+}
+
+function parseCodeReviewCommand(rawArg) {
+  const tokenized = splitCommandTokens(rawArg);
+  if (tokenized.error) return { error: tokenized.error };
+  const tokens = tokenized.tokens;
+  const reviewArgs = [];
+  const instructions = [];
+  let hasReviewTarget = false;
+
+  const readValue = (tokensList, index, option) => {
+    const value = sanitizeText(tokensList[index + 1]);
+    if (!value) {
+      return { error: `${option} 需要一个参数。` };
+    }
+    return { value, nextIndex: index + 1 };
+  };
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+
+    if (token === '--') {
+      instructions.push(...tokens.slice(index + 1));
+      break;
+    }
+
+    if (token === '--uncommitted') {
+      reviewArgs.push(token);
+      hasReviewTarget = true;
+      continue;
+    }
+
+    if (token === '--base' || token === '--commit') {
+      const parsed = readValue(tokens, index, token);
+      if (parsed.error) return { error: parsed.error };
+      reviewArgs.push(token, parsed.value);
+      hasReviewTarget = true;
+      index = parsed.nextIndex;
+      continue;
+    }
+
+    if (token.startsWith('--base=')) {
+      const value = sanitizeText(token.slice('--base='.length));
+      if (!value) return { error: '--base 需要一个参数。' };
+      reviewArgs.push('--base', value);
+      hasReviewTarget = true;
+      continue;
+    }
+
+    if (token.startsWith('--commit=')) {
+      const value = sanitizeText(token.slice('--commit='.length));
+      if (!value) return { error: '--commit 需要一个参数。' };
+      reviewArgs.push('--commit', value);
+      hasReviewTarget = true;
+      continue;
+    }
+
+    if (token === '--title') {
+      const parsed = readValue(tokens, index, token);
+      if (parsed.error) return { error: parsed.error };
+      reviewArgs.push(token, parsed.value);
+      index = parsed.nextIndex;
+      continue;
+    }
+
+    if (token.startsWith('--title=')) {
+      const value = sanitizeText(token.slice('--title='.length));
+      if (!value) return { error: '--title 需要一个参数。' };
+      reviewArgs.push('--title', value);
+      continue;
+    }
+
+    if (token === '-c' || token === '--config' || token === '--enable' || token === '--disable') {
+      const parsed = readValue(tokens, index, token);
+      if (parsed.error) return { error: parsed.error };
+      reviewArgs.push(token, parsed.value);
+      index = parsed.nextIndex;
+      continue;
+    }
+
+    if (
+      token.startsWith('-c=') ||
+      token.startsWith('--config=') ||
+      token.startsWith('--enable=') ||
+      token.startsWith('--disable=')
+    ) {
+      reviewArgs.push(token);
+      continue;
+    }
+
+    if (token === '--strict-config') {
+      reviewArgs.push(token);
+      continue;
+    }
+
+    if (token.startsWith('-')) {
+      return { error: `不支持的代码审查参数：${token}` };
+    }
+
+    instructions.push(token);
+  }
+
+  if (!hasReviewTarget) {
+    reviewArgs.unshift('--uncommitted');
+  }
+
+  return {
+    reviewArgs,
+    instructions: instructions.join(' ')
+  };
+}
+
+async function handleCodeReviewCommand(context, rawArg) {
+  const parsed = parseCodeReviewCommand(rawArg);
+  if (parsed.error) {
+    await safeSendReply(
+      context,
+      `${parsed.error}\n用法：/代码审查 [--uncommitted|--base <分支>|--commit <SHA>] [-- <审查说明>]`
+    );
+    return;
+  }
+
+  const check = await checkBackendAvailability('codex');
+  if (!check.ok) {
+    await safeSendReply(context, `无法启动 Codex 代码审查：${check.message}`);
+    return;
+  }
+  if (check.warn) {
+    await safeSendReply(context, `注意：${check.message}`);
+  }
+
+  const scopeKey = context.sessionScopeKey;
+  const task = {
+    kind: 'review',
+    action: null,
+    input: '/代码审查',
+    reviewPrompt: parsed.instructions,
+    reviewArgs: parsed.reviewArgs,
+    context,
+    workdir: getWorkdirForScope(scopeKey),
+    sessionScopeKey: scopeKey,
+    backend: 'codex',
+    codexModel: getCodexModelForScope(scopeKey),
+    goal: getGoalForScope(scopeKey),
+    accessMode: getAccessModeForScope(scopeKey)
+  };
+  const taskSessionKey = sessionIdentityForTask(task);
+  const depthBefore = queueDepthForSession(taskSessionKey);
+  const isSessionRunning = activeRuns.has(taskSessionKey);
+  const queuedAhead = depthBefore + (isSessionRunning ? 1 : 0);
+  enqueueToSessionQueue(taskSessionKey, task);
+  if (queuedAhead > 0) {
+    await safeSendReply(context, `代码审查已加入该 Codex 会话队列，前面还有 ${queuedAhead} 个任务。`);
+  } else if (activeRuns.size >= MAX_CONCURRENCY) {
+    await safeSendReply(context, `代码审查已加入队列，全局并发 ${activeRuns.size}/${MAX_CONCURRENCY} 已满。`);
+  }
+  tickQueues();
+}
+
 async function enqueueMessage(eventType, message, source = {}) {
   if (!message) return;
 
@@ -1001,6 +1272,11 @@ async function enqueueMessage(eventType, message, source = {}) {
     return;
   }
 
+  if (commandWord === '/目标') {
+    await handleGoalCommand(context, commandArg);
+    return;
+  }
+
   if (commandWord === '/backend') {
     await handleBackendCommand(context, commandArg);
     return;
@@ -1044,6 +1320,7 @@ async function enqueueMessage(eventType, message, source = {}) {
       sessionScopeKey: scopedApproval.sessionScopeKey,
       backend: scopedApproval.backend || 'codex',
       codexModel: scopedApproval.codexModel || getCodexModelForScope(scopedApproval.sessionScopeKey),
+      goal: scopedApproval.goal || getGoalForScope(scopedApproval.sessionScopeKey),
       accessMode: scopedApproval.accessMode
         || getAccessModeForScope(scopedApproval.sessionScopeKey)
     };
@@ -1068,6 +1345,11 @@ async function enqueueMessage(eventType, message, source = {}) {
     return;
   }
 
+  if (commandWord === '/代码审查' || commandWord === '/codex-review') {
+    await handleCodeReviewCommand(context, commandArg);
+    return;
+  }
+
   const task = {
     kind: 'user',
     action: null,
@@ -1077,6 +1359,7 @@ async function enqueueMessage(eventType, message, source = {}) {
     sessionScopeKey: context.sessionScopeKey,
     backend: getActiveBackend(context.sessionScopeKey),
     codexModel: getCodexModelForScope(context.sessionScopeKey),
+    goal: getGoalForScope(context.sessionScopeKey),
     accessMode: getAccessModeForScope(context.sessionScopeKey)
   };
   const taskSessionKey = sessionIdentityForTask(task);
@@ -1121,5 +1404,9 @@ module.exports = {
   formatBackendCheck,
   handleBackendCommand,
   switchAccessMode,
+  getGoalMessage,
+  handleGoalCommand,
+  parseCodeReviewCommand,
+  handleCodeReviewCommand,
   enqueueMessage
 };

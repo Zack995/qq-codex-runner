@@ -256,6 +256,20 @@ node main.js --weixin-logout --weixin-account default
   设置全局默认 Codex 模型
 - `/model global clear`
   清除全局默认 Codex 模型，回退到 Codex CLI 默认模型
+- `/目标`
+  查看当前聊天目标
+- `/目标 <内容>`
+  设置当前聊天目标，后续普通任务和代码审查都会带上这段目标上下文
+- `/目标 clear` 或 `/目标 清除`
+  清除当前聊天目标
+- `/代码审查`
+  使用 Codex 原生 `codex exec review --uncommitted` 审查当前未提交改动
+- `/代码审查 --base <分支>`
+  审查相对指定分支的改动
+- `/代码审查 --commit <SHA>`
+  审查指定提交
+- `/代码审查 -- <说明>`
+  附加审查说明；未指定 `--base` / `--commit` / `--uncommitted` 时默认审查未提交改动
 - `/backend`
   查看当前聊天的后端，并检测 codex / claude 两个 CLI 的可用性
 - `/backend <codex|claude>`
@@ -286,6 +300,8 @@ node main.js --weixin-logout --weixin-account default
 - `/access` 切换权限模式是**热切**：已在跑的任务保持旧权限跑完；队列中未开始的任务以及下一条消息以新权限启动；会话保留
 - `/cwd` 切目录也是**热切**：已在跑的任务按原目录跑完；队列中未开始的任务仍以原目录跑；新消息走新目录。切回旧目录会恢复该目录旧会话
 - `/model` 切 Codex 模型也是**热切**：已在跑的任务保持原模型跑完；队列中已入队任务保持入队时模型；新消息走新模型。切回旧模型会恢复该模型旧会话
+- `/目标` 按当前聊天持久化；设置后会作为目标上下文带入后续普通任务和 `/代码审查`
+- `/代码审查` 走 Codex 原生 `codex exec review`，固定使用 Codex 后端，不会改变当前聊天的 `/backend` 选择
 - `/new` 只影响当前聊天（同 scope + workdir + backend）的会话 / 队列 / 待审批；不影响其他 bot / 用户
 - `/restart` 是全局核武：停止所有任务、清空所有队列、重置所有会话
 - Claude Code 的权限走 `--permission-mode`，无 Codex 的 `<approval_request>` 交互审批流程；`/allow` `/skip` `/reject` 仅对 Codex 生效

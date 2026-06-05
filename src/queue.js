@@ -15,7 +15,8 @@ const {
   queueDepthForSession,
   getActiveBackend,
   getAccessModeForScope,
-  getCodexModelForScope
+  getCodexModelForScope,
+  getGoalForScope
 } = require('./state');
 
 const { sendReply } = require('./exec');
@@ -23,8 +24,10 @@ const { sendReply } = require('./exec');
 const {
   buildUserPrompt,
   buildApprovalPrompt,
+  buildReviewPrompt,
   parseApprovalRequest,
-  runCodexExec
+  runCodexExec,
+  runCodexReviewExec
 } = require('./codex');
 
 const { runClaudeExec } = require('./claude');
@@ -40,6 +43,7 @@ async function executeTask(task, run) {
   const codexModel = backend === 'codex'
     ? sanitizeText(task.codexModel) || getCodexModelForScope(task.sessionScopeKey)
     : '';
+  const goal = sanitizeText(task.goal) || getGoalForScope(task.sessionScopeKey);
   const session = (run && run.session)
     || getScopedSession(task.sessionScopeKey, task.workdir, backend, codexModel);
   const sessionKey = sessionIdentityForTask({ ...task, backend, codexModel });
@@ -49,18 +53,31 @@ async function executeTask(task, run) {
   const queueHint = queueDepth > 0 ? `，该会话队列剩余 ${queueDepth} 条` : '';
   await sendReply(
     task.context,
-    `开始执行（${BACKEND_LABELS[backend]}，并发槽 ${activeRuns.size}/${MAX_CONCURRENCY}${queueHint}）。`
+    `开始执行（${BACKEND_LABELS[backend]}${task.kind === 'review' ? ' 代码审查' : ''}，并发槽 ${activeRuns.size}/${MAX_CONCURRENCY}${queueHint}）。`
   );
 
   try {
     const includePolicy = !(session.hasConversation && session.threadId);
     const prompt = task.kind === 'approval'
-      ? buildApprovalPrompt(task.action, pendingApprovalForSession, { includePolicy, accessMode })
-      : buildUserPrompt(task.input, { includePolicy, backend, accessMode });
+      ? buildApprovalPrompt(task.action, pendingApprovalForSession, { includePolicy, accessMode, goal })
+      : task.kind === 'review'
+        ? buildReviewPrompt(task.reviewPrompt, { goal })
+        : buildUserPrompt(task.input, { includePolicy, backend, accessMode, goal });
 
-    const reply = backend === 'claude'
-      ? await runClaudeExec(prompt, session, task.workdir, task.context, run, accessMode)
-      : await runCodexExec(prompt, session, task.workdir, task.context, run, accessMode, codexModel);
+    const reply = task.kind === 'review'
+      ? await runCodexReviewExec(
+        prompt,
+        session,
+        task.workdir,
+        task.context,
+        run,
+        accessMode,
+        codexModel,
+        task.reviewArgs
+      )
+      : backend === 'claude'
+        ? await runClaudeExec(prompt, session, task.workdir, task.context, run, accessMode)
+        : await runCodexExec(prompt, session, task.workdir, task.context, run, accessMode, codexModel);
     if (!reply) {
       return;
     }
@@ -76,6 +93,7 @@ async function executeTask(task, run) {
         sessionScopeKey: task.sessionScopeKey,
         backend,
         codexModel,
+        goal,
         accessMode
       });
       const approvalMessage = [
