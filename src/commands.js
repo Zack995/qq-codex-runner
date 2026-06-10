@@ -7,6 +7,7 @@ const path = require('path');
 
 const {
   sanitizeText,
+  compactWhitespace,
   log,
   splitMessage,
   resolveInputPath,
@@ -34,6 +35,12 @@ const {
   RUNNER_CODEX_HOME,
   CODEX_CONTEXT_WINDOW_OVERRIDE,
   CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE,
+  CODEX_MODEL_REASONING_EFFORT,
+  CODEX_PASSTHROUGH_COMMANDS,
+  CODEX_PROVIDER_SYNC_ENABLED,
+  CODEX_PROVIDER_SYNC_SOURCE_HOME,
+  CODEX_PROVIDER_SYNC_NAME,
+  CODEX_PROVIDER_SYNC_AUTH,
   CLAUDE_BIN,
   RUNNER_CLAUDE_HOME,
   DEFAULT_WORKDIR,
@@ -92,7 +99,7 @@ const {
   summarizeProbeFailure
 } = require('./exec');
 
-const { getCodexBin } = require('./codex');
+const { getCodexBin, runCodexProviderConfigSync } = require('./codex');
 const { formatClaudeContextLines } = require('./claude');
 
 const { extractWeixinText } = require('./weixin');
@@ -383,6 +390,11 @@ function getHelpMessage() {
     '/代码审查 --commit <SHA> - 审查指定提交',
     '/代码审查 -- <说明> - 附加审查说明',
     '',
+    '/codex-sync - 立即同步 CodexPlusPlus provider/auth 配置到 Runner CODEX_HOME',
+    '/同步配置 /刷新配置 - 同上',
+    '',
+    `${formatCodexPassthroughCommands()} - 透传给 Codex CLI 的自定义指令（默认支持 /fast）`,
+    '',
     '/backend - 查看当前后端 + 检测 codex / claude 可用性',
     '/backend <codex|claude> - 切换当前聊天的后端（按聊天独立生效）',
     '',
@@ -399,6 +411,65 @@ function formatClientStatuses(entries, emptyLabel) {
     const label = name && name !== id ? `${name}（${id}）` : id;
     return `${label}${ready ? ' ✓' : ' ✗'}`;
   }).join('，');
+}
+
+function formatCodexPassthroughCommands() {
+  return CODEX_PASSTHROUGH_COMMANDS.length > 0
+    ? CODEX_PASSTHROUGH_COMMANDS.join(', ')
+    : '未配置 Codex 透传指令';
+}
+
+function formatCodexProviderSyncStatus() {
+  if (!CODEX_PROVIDER_SYNC_ENABLED) return '关闭';
+  const source = CODEX_PROVIDER_SYNC_SOURCE_HOME || '主 CODEX_HOME';
+  const provider = CODEX_PROVIDER_SYNC_NAME || '跟随 source model_provider';
+  const auth = CODEX_PROVIDER_SYNC_AUTH ? '同步 auth.json' : '不同步 auth.json';
+  return `开启（source=${source}，provider=${provider}，${auth}）`;
+}
+
+function formatCodexProviderSyncResult(result) {
+  if (!result || typeof result !== 'object') return '未知结果';
+  const provider = sanitizeText(result.provider) || '已清除/未设置';
+  const reason = sanitizeText(result.reason);
+  if (reason && !['provider', 'builtin_provider', 'unchanged', 'cleared_missing_model_provider'].includes(reason)) {
+    return [
+      'Codex 配置同步未完成：',
+      `原因：${reason}`,
+      `Provider：${provider}`,
+      `Source：${CODEX_PROVIDER_SYNC_SOURCE_HOME || PRIMARY_CODEX_HOME || '未设置'}`,
+      `Target：${RUNNER_CODEX_HOME || '未设置'}`
+    ].join('\n');
+  }
+
+  const configStatus = result.configSynced ? '已更新' : '无变化';
+  const authStatus = CODEX_PROVIDER_SYNC_AUTH
+    ? (result.authSynced ? '已更新' : '无变化')
+    : '已关闭';
+  const authReason = sanitizeText(result.auth && result.auth.reason);
+  const lines = [
+    'Codex 配置同步完成：',
+    `Provider：${provider}`,
+    `config.toml：${configStatus}`,
+    `auth.json：${authStatus}`,
+    `Source：${CODEX_PROVIDER_SYNC_SOURCE_HOME || PRIMARY_CODEX_HOME || '未设置'}`,
+    `Target：${RUNNER_CODEX_HOME || '未设置'}`,
+    '热更新范围：后续 Codex 任务立即生效；已在运行的任务保持启动时配置。'
+  ];
+  if (reason && reason !== 'provider' && reason !== 'builtin_provider' && reason !== 'unchanged') {
+    lines.push(`配置状态：${reason}`);
+  }
+  if (authReason && authReason !== 'auth' && authReason !== 'auth_sync_disabled') {
+    lines.push(`认证状态：${authReason}`);
+  }
+  return lines.join('\n');
+}
+
+function shouldPassthroughToCodex(input) {
+  const normalizedInput = compactWhitespace(input).toLowerCase();
+  if (!normalizedInput) return false;
+  return CODEX_PASSTHROUGH_COMMANDS.some((command) => (
+    normalizedInput === command || normalizedInput.startsWith(`${command} `)
+  ));
 }
 
 function getStatusMessage(context) {
@@ -446,6 +517,9 @@ function getStatusMessage(context) {
     lines.push(
       `Runner CODEX_HOME：${RUNNER_CODEX_HOME || '继承系统默认'}`,
       `Codex 模型：${codexModel || '未设置（使用 Codex CLI 默认模型）'}`,
+      `Codex 默认推理强度：${CODEX_MODEL_REASONING_EFFORT || '继承 Codex 配置'}`,
+      `Codex 透传指令：${formatCodexPassthroughCommands()}`,
+      `Codex Provider 同步：${formatCodexProviderSyncStatus()}`,
       `Codex 上下文窗口：${formatCodexConfigValue(contextWindow, {
         overridden: Boolean(CODEX_CONTEXT_WINDOW_OVERRIDE)
       })}`,
@@ -486,7 +560,9 @@ function getQueueMessage() {
         ? '审批任务'
         : run.task && run.task.kind === 'review'
           ? '代码审查任务'
-          : '普通任务';
+          : run.task && run.task.kind === 'passthrough'
+            ? '透传指令任务'
+            : '普通任务';
       lines.push(`  · ${run.session.scopeKey} [${backendLabel}] ${taskKind}`);
     }
   }
@@ -538,6 +614,9 @@ function getSessionMessage(context) {
     lines.push(
       `Runner CODEX_HOME：${RUNNER_CODEX_HOME || '继承系统默认'}`,
       `Codex 模型：${codexModel || '未设置（使用 Codex CLI 默认模型）'}`,
+      `Codex 默认推理强度：${CODEX_MODEL_REASONING_EFFORT || '继承 Codex 配置'}`,
+      `Codex 透传指令：${formatCodexPassthroughCommands()}`,
+      `Codex Provider 同步：${formatCodexProviderSyncStatus()}`,
       `Codex 自动压缩阈值：${formatCodexConfigValue(autoCompactTokenLimit, {
         overridden: Boolean(CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE)
       })}`
@@ -1210,6 +1289,67 @@ async function handleCodeReviewCommand(context, rawArg) {
   tickQueues();
 }
 
+async function handleCodexPassthroughCommand(context, input) {
+  const check = await checkBackendAvailability('codex');
+  if (!check.ok) {
+    await safeSendReply(context, `无法透传给 Codex：${check.message}`);
+    return;
+  }
+  if (check.warn) {
+    await safeSendReply(context, `注意：${check.message}`);
+  }
+
+  const scopeKey = context.sessionScopeKey;
+  const task = {
+    kind: 'passthrough',
+    action: null,
+    input,
+    context,
+    workdir: getWorkdirForScope(scopeKey),
+    sessionScopeKey: scopeKey,
+    backend: 'codex',
+    codexModel: getCodexModelForScope(scopeKey),
+    goal: getGoalForScope(scopeKey),
+    accessMode: getAccessModeForScope(scopeKey)
+  };
+  const taskSessionKey = sessionIdentityForTask(task);
+  const depthBefore = queueDepthForSession(taskSessionKey);
+  const isSessionRunning = activeRuns.has(taskSessionKey);
+  const queuedAhead = depthBefore + (isSessionRunning ? 1 : 0);
+  enqueueToSessionQueue(taskSessionKey, task);
+  if (queuedAhead > 0) {
+    await safeSendReply(context, `Codex 透传指令已加入该会话队列，前面还有 ${queuedAhead} 个任务。`);
+  } else if (activeRuns.size >= MAX_CONCURRENCY) {
+    await safeSendReply(context, `Codex 透传指令已加入队列，全局并发 ${activeRuns.size}/${MAX_CONCURRENCY} 已满。`);
+  }
+  tickQueues();
+}
+
+async function handleCodexProviderSyncCommand(context) {
+  if (!CODEX_PROVIDER_SYNC_ENABLED) {
+    await safeSendReply(
+      context,
+      'Codex Provider 同步未开启。请在启动配置里设置 CODEX_PROVIDER_SYNC=true 后重启 runner。'
+    );
+    return;
+  }
+  if (!RUNNER_CODEX_HOME) {
+    await safeSendReply(
+      context,
+      '无法同步：RUNNER_CODEX_HOME 未设置。请给 runner 配独立 CODEX_HOME，或直接共用 CODEX_HOME。'
+    );
+    return;
+  }
+
+  try {
+    const result = runCodexProviderConfigSync();
+    await safeSendReply(context, formatCodexProviderSyncResult(result));
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    await safeSendReply(context, `CodexPlusPlus 配置同步失败：${message}`);
+  }
+}
+
 async function enqueueMessage(eventType, message, source = {}) {
   if (!message) return;
 
@@ -1282,6 +1422,11 @@ async function enqueueMessage(eventType, message, source = {}) {
     return;
   }
 
+  if (commandWord === '/codex-sync' || commandWord === '/同步配置' || commandWord === '/刷新配置') {
+    await handleCodexProviderSyncCommand(context);
+    return;
+  }
+
   if (input === '/new') {
     await resetCodexSession(context);
     return;
@@ -1342,6 +1487,11 @@ async function enqueueMessage(eventType, message, source = {}) {
 
   if (context.platform === 'weixin' && !context.peerId) {
     log(`Ignoring Weixin message without peer id: ${context.messageId}`);
+    return;
+  }
+
+  if (shouldPassthroughToCodex(input)) {
+    await handleCodexPassthroughCommand(context, input);
     return;
   }
 
@@ -1408,5 +1558,11 @@ module.exports = {
   handleGoalCommand,
   parseCodeReviewCommand,
   handleCodeReviewCommand,
+  formatCodexPassthroughCommands,
+  formatCodexProviderSyncStatus,
+  formatCodexProviderSyncResult,
+  handleCodexProviderSyncCommand,
+  shouldPassthroughToCodex,
+  handleCodexPassthroughCommand,
   enqueueMessage
 };

@@ -129,6 +129,12 @@ CODEX_HOME=../.codex
 RUNNER_CODEX_HOME=../.codex-qq-runner
 CODEX_EXEC_TIMEOUT_MS=1800000
 CODEX_AUTO_COMPACT_TOKEN_LIMIT=500000
+CODEX_MODEL_REASONING_EFFORT=xhigh
+CODEX_PASSTHROUGH_COMMANDS=/fast
+CODEX_PROVIDER_SYNC=true
+CODEX_PROVIDER_SYNC_SOURCE_HOME=../.codex
+CODEX_PROVIDER_SYNC_NAME=
+CODEX_PROVIDER_SYNC_AUTH=true
 
 # Claude Code 后端
 CLAUDE_BIN=claude
@@ -155,9 +161,33 @@ WEIXIN_BOT_TYPE=3
 - `RUNNER_CODEX_HOME` / `RUNNER_CLAUDE_HOME` 建议单独设置，避免和你手动开的 CLI 共用会话存储
 - `CODEX_EXEC_TIMEOUT_MS` 是"无新输出超时"，不是总执行时长；Claude 后端复用这一超时
 - `CODEX_AUTO_COMPACT_TOKEN_LIMIT` 会覆盖 runner 会话的 Codex 自动压缩阈值
+- `CODEX_MODEL_REASONING_EFFORT` 默认 `xhigh`，会以 `-c model_reasoning_effort="..."` 透传给 Codex
+- `CODEX_PASSTHROUGH_COMMANDS` 配置需要原样交给 Codex CLI 的 slash 指令，默认 `/fast`；可带固定参数，例如 `/fast status`，多个规则用逗号分隔
+- `CODEX_PROVIDER_SYNC=true` 会在每次启动 Codex 任务前，把 `CODEX_PROVIDER_SYNC_SOURCE_HOME/config.toml` 中的 `model_provider`、对应 `[model_providers.<name>]` 和相关顶层 provider 配置同步到 `RUNNER_CODEX_HOME/config.toml`
+- `CODEX_PROVIDER_SYNC_NAME` 可固定同步指定 provider；留空时跟随 source 配置里的 `model_provider`。这既适合配合 CodexPlusPlus 切供应商后让 runner 联动，也兼容原生 `.codex/config.toml` 里的 provider 配置
+- `CODEX_PROVIDER_SYNC_AUTH=true` 会同时同步 `auth.json`，适合 CodexPlusPlus 在 API 模式 / 官方登录态之间切换；如果 runner 要保留独立登录态，可设为 `false`
 - 如果 `config.toml` 里的压缩阈值设得很高，聊天里会看起来像"不压缩"
 - `CODEX_ACCESS_MODE` 同时控制两个后端的权限：`read→plan`、`write/safe→acceptEdits`、`full→bypassPermissions`
 - `RUNNER_DEFAULT_BACKEND` 只影响首次进入某个聊天时的默认后端；之后 `/backend` 切换会被持久化
+
+### 配合 CodexPlusPlus / 原生 Codex 配置
+
+CodexPlusPlus 的中转注入会修改 `~/.codex/config.toml` 里的 `model_provider`、对应 `[model_providers.<name>]`，并可能更新 `auth.json`。如果 runner 使用独立的 `RUNNER_CODEX_HOME`，可以这样让它在每次 Codex 任务启动前跟随：
+
+```env
+CODEX_HOME=/Users/you/.codex
+RUNNER_CODEX_HOME=/Users/you/.codex-qq-runner
+CODEX_PROVIDER_SYNC=true
+CODEX_PROVIDER_SYNC_SOURCE_HOME=/Users/you/.codex
+CODEX_PROVIDER_SYNC_NAME=
+CODEX_PROVIDER_SYNC_AUTH=true
+```
+
+这样在 CodexPlusPlus 里切到新供应商后，QQ / 微信里下一次 Codex 任务会自动同步当前 provider；清除 API 模式回官方登录态时，也会清掉 runner 里旧的 `model_provider` 配置。
+
+如果没有使用 CodexPlusPlus，也可以把 `CODEX_PROVIDER_SYNC_SOURCE_HOME` 指向原生 `.codex` 目录；runner 会读取其中已有的 `model_provider`、`[model_providers.*]` 和相关顶层 provider 配置保持兼容。
+
+也可以在 QQ / 微信里发送 `/codex-sync`、`/同步配置` 或 `/刷新配置` 立即刷新，不需要等下一条 Codex 任务；刷新后，后续任务和排队中尚未启动的任务会使用新配置，已在运行的子进程保持启动时配置。
 
 ## 启动与管理
 
@@ -270,6 +300,10 @@ node main.js --weixin-logout --weixin-account default
   审查指定提交
 - `/代码审查 -- <说明>`
   附加审查说明；未指定 `--base` / `--commit` / `--uncommitted` 时默认审查未提交改动
+- `/codex-sync`、`/同步配置`、`/刷新配置`
+  立即同步当前 source Codex Home 的 provider / `auth.json` 到 runner 的 `RUNNER_CODEX_HOME`，完成配置热更新
+- `/fast`
+  默认作为 Codex CLI 透传指令原样发送给 Codex；可用 `CODEX_PASSTHROUGH_COMMANDS` 自定义更多透传指令和参数，例如 `CODEX_PASSTHROUGH_COMMANDS="/fast status,/foo bar"`
 - `/backend`
   查看当前聊天的后端，并检测 codex / claude 两个 CLI 的可用性
 - `/backend <codex|claude>`
@@ -302,6 +336,8 @@ node main.js --weixin-logout --weixin-account default
 - `/model` 切 Codex 模型也是**热切**：已在跑的任务保持原模型跑完；队列中已入队任务保持入队时模型；新消息走新模型。切回旧模型会恢复该模型旧会话
 - `/目标` 按当前聊天持久化；设置后会作为目标上下文带入后续普通任务和 `/代码审查`
 - `/代码审查` 走 Codex 原生 `codex exec review`，固定使用 Codex 后端，不会改变当前聊天的 `/backend` 选择
+- `CODEX_PASSTHROUGH_COMMANDS` 中的指令会固定透传给 Codex 后端，不会改变当前聊天的 `/backend` 选择；默认 `/fast`
+- 透传指令的 Codex 返回内容会按普通任务回复到当前聊天
 - `/new` 只影响当前聊天（同 scope + workdir + backend）的会话 / 队列 / 待审批；不影响其他 bot / 用户
 - `/restart` 是全局核武：停止所有任务、清空所有队列、重置所有会话
 - Claude Code 的权限走 `--permission-mode`，无 Codex 的 `<approval_request>` 交互审批流程；`/allow` `/skip` `/reject` 仅对 Codex 生效

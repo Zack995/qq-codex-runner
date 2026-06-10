@@ -6,6 +6,7 @@ const path = require('path');
 
 const {
   sanitizeText,
+  compactWhitespace,
   log,
   resolveInputPath,
   parseList,
@@ -135,6 +136,12 @@ function extractCodexModelArg(args) {
   }
 
   return { codexArgs, codexModel };
+}
+
+function normalizePassthroughCommandPattern(value) {
+  const normalized = compactWhitespace(value).toLowerCase();
+  if (!normalized) return '';
+  return normalized.startsWith('/') ? normalized : `/${normalized}`;
 }
 
 const INTENT_FLAGS = {
@@ -285,6 +292,17 @@ function loadRuntimeConfig() {
   );
   const CODEX_CONTEXT_WINDOW_OVERRIDE = getPositiveIntegerEnv('CODEX_CONTEXT_WINDOW');
   const CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE = getPositiveIntegerEnv('CODEX_AUTO_COMPACT_TOKEN_LIMIT');
+  const CODEX_MODEL_REASONING_EFFORT = sanitizeText(process.env.CODEX_MODEL_REASONING_EFFORT || 'xhigh');
+  const CODEX_PASSTHROUGH_COMMANDS = parseList(process.env.CODEX_PASSTHROUGH_COMMANDS || '/fast')
+    .map((item) => normalizePassthroughCommandPattern(item))
+    .filter(Boolean);
+  const CODEX_PROVIDER_SYNC_ENABLED = parseBoolean(process.env.CODEX_PROVIDER_SYNC, false);
+  const CODEX_PROVIDER_SYNC_SOURCE_HOME = (() => {
+    const raw = sanitizeText(process.env.CODEX_PROVIDER_SYNC_SOURCE_HOME || PRIMARY_CODEX_HOME);
+    return raw ? resolveInputPath(raw) : '';
+  })();
+  const CODEX_PROVIDER_SYNC_NAME = sanitizeText(process.env.CODEX_PROVIDER_SYNC_NAME || '');
+  const CODEX_PROVIDER_SYNC_AUTH = parseBoolean(process.env.CODEX_PROVIDER_SYNC_AUTH, true);
 
   const CLAUDE_BIN = sanitizeText(process.env.CLAUDE_BIN) || 'claude';
   const RUNNER_CLAUDE_HOME = (() => {
@@ -313,6 +331,12 @@ function loadRuntimeConfig() {
     RUNNER_CODEX_HOME,
     CODEX_CONTEXT_WINDOW_OVERRIDE,
     CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE,
+    CODEX_MODEL_REASONING_EFFORT,
+    CODEX_PASSTHROUGH_COMMANDS,
+    CODEX_PROVIDER_SYNC_ENABLED,
+    CODEX_PROVIDER_SYNC_SOURCE_HOME,
+    CODEX_PROVIDER_SYNC_NAME,
+    CODEX_PROVIDER_SYNC_AUTH,
     CLAUDE_BIN,
     RUNNER_CLAUDE_HOME,
     DEFAULT_BACKEND,

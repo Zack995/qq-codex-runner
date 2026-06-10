@@ -16,7 +16,8 @@ const {
   getActiveBackend,
   getAccessModeForScope,
   getCodexModelForScope,
-  getGoalForScope
+  getGoalForScope,
+  ensureCodexSessionCanResume
 } = require('./state');
 
 const { sendReply } = require('./exec');
@@ -51,18 +52,28 @@ async function executeTask(task, run) {
 
   const queueDepth = queueDepthForSession(sessionKey);
   const queueHint = queueDepth > 0 ? `，该会话队列剩余 ${queueDepth} 条` : '';
+  const kindLabel = task.kind === 'review'
+    ? ' 代码审查'
+    : task.kind === 'passthrough'
+      ? ' 透传指令'
+      : '';
   await sendReply(
     task.context,
-    `开始执行（${BACKEND_LABELS[backend]}${task.kind === 'review' ? ' 代码审查' : ''}，并发槽 ${activeRuns.size}/${MAX_CONCURRENCY}${queueHint}）。`
+    `开始执行（${BACKEND_LABELS[backend]}${kindLabel}，并发槽 ${activeRuns.size}/${MAX_CONCURRENCY}${queueHint}）。`
   );
 
   try {
+    if (backend === 'codex') {
+      ensureCodexSessionCanResume(session);
+    }
     const includePolicy = !(session.hasConversation && session.threadId);
     const prompt = task.kind === 'approval'
       ? buildApprovalPrompt(task.action, pendingApprovalForSession, { includePolicy, accessMode, goal })
       : task.kind === 'review'
         ? buildReviewPrompt(task.reviewPrompt, { goal })
-        : buildUserPrompt(task.input, { includePolicy, backend, accessMode, goal });
+        : task.kind === 'passthrough'
+          ? sanitizeText(task.input)
+          : buildUserPrompt(task.input, { includePolicy, backend, accessMode, goal });
 
     const reply = task.kind === 'review'
       ? await runCodexReviewExec(

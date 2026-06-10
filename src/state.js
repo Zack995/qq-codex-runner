@@ -199,6 +199,10 @@ function loadPersistedTokenUsageByThreadId(threadId) {
   return extractTokenUsageFromExecEvents(parseExecJsonEvents(content));
 }
 
+function hasCodexRolloutForThreadId(threadId) {
+  return Boolean(findCodexRolloutFileByThreadId(threadId));
+}
+
 // === Persistence load ===
 
 function resolveExistingDirectory(targetPath) {
@@ -585,6 +589,10 @@ function hydratePersistedCodexSessions(persistedState) {
     const codexModel = backend === 'codex'
       ? sanitizeText(record.codexModel || record.codex_model)
       : '';
+    if (backend === 'codex' && !hasCodexRolloutForThreadId(threadId)) {
+      log(`Skipping stale Codex session without rollout: ${threadId}`);
+      continue;
+    }
 
     const key = buildSessionIdentity(scopeKey, resolvedWorkdir, backend, codexModel);
     const persistedLastTokenUsage = normalizeTokenUsage(record.lastTokenUsage || record.last_token_usage);
@@ -666,6 +674,19 @@ function resetSessionState(session) {
   session.lastTokenUsage = null;
   session.totalTokenUsage = null;
   session.generation += 1;
+}
+
+function ensureCodexSessionCanResume(session) {
+  if (!session || session.backend !== 'codex' || !session.hasConversation || !session.threadId) {
+    return false;
+  }
+  if (hasCodexRolloutForThreadId(session.threadId)) {
+    return true;
+  }
+  log(`Resetting stale Codex session without rollout: ${session.threadId}`);
+  resetSessionState(session);
+  persistRunnerState();
+  return false;
 }
 
 // === Run / queue helpers ===
@@ -955,6 +976,7 @@ module.exports = {
   getCodexAutoCompactStatus,
   findCodexRolloutFileByThreadId,
   loadPersistedTokenUsageByThreadId,
+  hasCodexRolloutForThreadId,
   // persistence
   loadPersistedRunnerState,
   deriveInitialRunnerState,
@@ -988,6 +1010,7 @@ module.exports = {
   ensureSessionTokenUsage,
   bumpSessionGeneration,
   resetSessionState,
+  ensureCodexSessionCanResume,
   // run/queue
   stopActiveRun,
   stopAllActiveRuns,

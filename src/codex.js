@@ -7,6 +7,7 @@ const path = require('path');
 const {
   sanitizeText,
   compactWhitespace,
+  log,
   addTokenUsage,
   normalizeTokenUsage
 } = require('./util');
@@ -15,14 +16,21 @@ const config = require('./config');
 const { VALID_ACCESS_MODES } = config;
 const {
   RUNNER_CODEX_HOME,
+  PRIMARY_CODEX_HOME,
   CODEX_CONTEXT_WINDOW_OVERRIDE,
-  CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE
+  CODEX_AUTO_COMPACT_TOKEN_LIMIT_OVERRIDE,
+  CODEX_MODEL_REASONING_EFFORT,
+  CODEX_PROVIDER_SYNC_ENABLED,
+  CODEX_PROVIDER_SYNC_SOURCE_HOME,
+  CODEX_PROVIDER_SYNC_NAME,
+  CODEX_PROVIDER_SYNC_AUTH
 } = config.loadRuntimeConfig();
 
 const {
   runnerState,
   extractTokenUsageFromExecEvents,
   extractThreadIdFromExecEvents,
+  ensureCodexSessionCanResume,
   persistRunnerState
 } = require('./state');
 
@@ -30,6 +38,8 @@ const {
   runAgentChildProcess,
   describeBackendRuntimeError
 } = require('./exec');
+
+const { syncCodexProviderConfig } = require('./codex-provider-sync');
 
 // Codex CLI bin + extra args supplied by main.js after parseArgs.
 let codexBin = process.env.CODEX_BIN || 'codex';
@@ -45,6 +55,32 @@ function setCodexExtraArgs(args) {
 
 function getCodexBin() {
   return codexBin;
+}
+
+function runCodexProviderConfigSync() {
+  if (!CODEX_PROVIDER_SYNC_ENABLED) {
+    return { synced: false, reason: 'disabled' };
+  }
+  if (!RUNNER_CODEX_HOME) {
+    return { synced: false, reason: 'same_or_missing_home' };
+  }
+  return syncCodexProviderConfig({
+    enabled: CODEX_PROVIDER_SYNC_ENABLED,
+    sourceHome: CODEX_PROVIDER_SYNC_SOURCE_HOME || PRIMARY_CODEX_HOME,
+    targetHome: RUNNER_CODEX_HOME,
+    providerName: CODEX_PROVIDER_SYNC_NAME,
+    syncAuth: CODEX_PROVIDER_SYNC_AUTH
+  });
+}
+
+function syncCodexProviderConfigIfNeeded() {
+  try {
+    return runCodexProviderConfigSync();
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    log(`Failed to sync Codex provider config: ${message}`);
+    return { synced: false, reason: 'error', error: message };
+  }
 }
 
 function summarizeExecFailure(stderr, stdout) {
@@ -287,6 +323,20 @@ function buildReviewPrompt(instructions, options = {}) {
   return parts.join('\n\n');
 }
 
+function formatCodexStringConfig(key, value) {
+  const normalizedKey = sanitizeText(key);
+  const normalizedValue = sanitizeText(value);
+  if (!normalizedKey || !normalizedValue) return '';
+  return `${normalizedKey}=${JSON.stringify(normalizedValue)}`;
+}
+
+function pushDefaultCodexConfigArgs(args) {
+  const reasoningEffortConfig = formatCodexStringConfig('model_reasoning_effort', CODEX_MODEL_REASONING_EFFORT);
+  if (reasoningEffortConfig) {
+    args.push('-c', reasoningEffortConfig);
+  }
+}
+
 function buildCodexArgs(prompt, outputFile, session, workdir, accessMode, codexModel) {
   const args = ['exec'];
   const mode = sanitizeText(accessMode).toLowerCase() || runnerState.accessMode;
@@ -297,6 +347,7 @@ function buildCodexArgs(prompt, outputFile, session, workdir, accessMode, codexM
   if (model) {
     args.push('--model', model);
   }
+  pushDefaultCodexConfigArgs(args);
   if (CODEX_CONTEXT_WINDOW_OVERRIDE) {
     args.push('-c', `model_context_window=${CODEX_CONTEXT_WINDOW_OVERRIDE}`);
   }
@@ -309,7 +360,7 @@ function buildCodexArgs(prompt, outputFile, session, workdir, accessMode, codexM
   if (accessConfig.bypass) {
     args.push('--dangerously-bypass-approvals-and-sandbox');
   }
-  if (session && session.hasConversation && session.threadId) {
+  if (ensureCodexSessionCanResume(session)) {
     args.push('resume', session.threadId);
   }
   args.push('--skip-git-repo-check', '--json', '--output-last-message', outputFile);
@@ -320,6 +371,7 @@ function buildCodexArgs(prompt, outputFile, session, workdir, accessMode, codexM
 
 function runCodexExec(prompt, session, workdir, context, run, accessMode, codexModel) {
   const outputFile = path.join(os.tmpdir(), `qq-codex-runner-last-${process.pid}-${Date.now()}.txt`);
+  syncCodexProviderConfigIfNeeded();
   const args = buildCodexArgs(prompt, outputFile, session, workdir, accessMode, codexModel);
   const env = { ...process.env, TERM: process.env.TERM || 'xterm-256color' };
   if (RUNNER_CODEX_HOME) env.CODEX_HOME = RUNNER_CODEX_HOME;
@@ -373,6 +425,7 @@ function buildCodexReviewArgs(prompt, outputFile, session, accessMode, codexMode
   if (model) {
     args.push('--model', model);
   }
+  pushDefaultCodexConfigArgs(args);
   if (CODEX_CONTEXT_WINDOW_OVERRIDE) {
     args.push('-c', `model_context_window=${CODEX_CONTEXT_WINDOW_OVERRIDE}`);
   }
@@ -394,6 +447,7 @@ function buildCodexReviewArgs(prompt, outputFile, session, accessMode, codexMode
 
 function runCodexReviewExec(prompt, session, workdir, context, run, accessMode, codexModel, reviewArgs) {
   const outputFile = path.join(os.tmpdir(), `qq-codex-runner-review-${process.pid}-${Date.now()}.txt`);
+  syncCodexProviderConfigIfNeeded();
   const args = buildCodexReviewArgs(prompt, outputFile, session, accessMode, codexModel, reviewArgs);
   const env = { ...process.env, TERM: process.env.TERM || 'xterm-256color' };
   if (RUNNER_CODEX_HOME) env.CODEX_HOME = RUNNER_CODEX_HOME;
@@ -452,6 +506,8 @@ module.exports = {
   buildUserPrompt,
   buildApprovalPrompt,
   buildReviewPrompt,
+  runCodexProviderConfigSync,
+  syncCodexProviderConfigIfNeeded,
   buildCodexArgs,
   runCodexExec,
   buildCodexReviewArgs,
